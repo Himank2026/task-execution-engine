@@ -10,13 +10,14 @@ import (
 )
 
 // SetupRouter builds the Gin engine and wires the dependency graph:
-// db -> service -> controller, then registers routes. This is where DI happens —
-// each layer is constructed once here and handed its dependencies.
-func SetupRouter(db *gorm.DB) *gin.Engine {
+// service -> controller, then registers routes. The TaskService is passed in
+// (not built here) so main can share ONE instance between the HTTP layer and the
+// worker pool — both must operate on the same business logic. db is still needed
+// for the auth middleware's key lookups.
+func SetupRouter(db *gorm.DB, taskService *services.TaskService) *gin.Engine {
 	r := gin.Default()
 
-	// Build the layers, inside-out.
-	taskService := services.NewTaskService(db)
+	// Build the controller on top of the shared service.
 	taskController := controllers.NewTaskController(taskService)
 
 	api := r.Group("/api")

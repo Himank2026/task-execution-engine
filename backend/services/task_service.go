@@ -16,6 +16,10 @@ import (
 // maps this to HTTP 409 Conflict.
 var ErrTaskNotCancellable = errors.New("task is not in a cancellable state")
 
+// ErrNoTask signals that the queue currently has no pending task. It's a normal
+// condition, not a failure — a worker that gets this just waits and tries again.
+var ErrNoTask = errors.New("no pending task available")
+
 // TaskService holds the business logic for tasks. It depends only on the DB —
 // not on Gin or HTTP — so anything (an HTTP controller now, the worker pool
 // later) can call it. The db is injected via NewTaskService.
@@ -157,6 +161,138 @@ func (s *TaskService) ListTasks(clientID string, f ListTasksFilter) (*ListTasksR
 	}, nil
 }
 
+// DequeueTask atomically claims the next pending task for this instance and marks
+// it running. It is the concurrency-safe heart of the system:
+//
+//	BEGIN
+//	  SELECT ... FOR UPDATE SKIP LOCKED   -- claim one row, skip rows others hold
+//	  UPDATE ... SET status='running'     -- flip it, stamp who's running it
+//	COMMIT
+//
+// Because the SELECT locks the row and SKIP LOCKED steps over already-claimed
+// rows, no two workers (or backend instances) ever grab the same task. The lock
+// only exists inside the transaction, which is why both statements run in one.
+//
+// Returns ErrNoTask when the queue is empty (a normal, expected condition).
+func (s *TaskService) DequeueTask(instanceID string) (*models.Task, error) {
+	var task models.Task
+
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		// Raw SQL on purpose: GORM has no first-class SKIP LOCKED, and we want the
+		// exact locking semantics visible. ORDER BY priority DESC, created_at ASC
+		// = highest priority first, oldest-first within a priority (FIFO).
+		result := tx.Raw(`
+			SELECT id, client_id, type, priority, payload, status, retry_count, max_retries, created_at
+			FROM tasks
+			WHERE status = 'pending'
+			ORDER BY priority DESC, created_at ASC
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		`).Scan(&task)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrNoTask // queue empty
+		}
+
+		// Same transaction: flip the claimed row to running so no one re-picks it
+		// after we COMMIT and release the lock.
+		now := time.Now()
+		if err := tx.Model(&models.Task{}).
+			Where("id = ?", task.ID).
+			Updates(map[string]any{
+				"status":       "running",
+				"started_at":   now,
+				"processed_by": instanceID,
+			}).Error; err != nil {
+			return err
+		}
+
+		// Reflect the changes in the returned struct (the SELECT read the old row).
+		task.Status = "running"
+		task.StartedAt = &now
+		task.ProcessedBy = &instanceID
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+// CompleteTask marks a successfully-run task as completed. completed_at is set so
+// throughput analytics (completions per time window) have a timestamp to count.
+func (s *TaskService) CompleteTask(id uint64) error {
+	now := time.Now()
+	return s.db.Model(&models.Task{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"status":       "completed",
+			"completed_at": now,
+		}).Error
+}
+
+// FailTask handles a task whose handler returned an error. It forks:
+//   - retries left  -> bump retry_count, put it back to "pending", CLEAR the
+//     timing fields so the next attempt times cleanly (the retry rule).
+//   - retries exhausted -> dead-letter it (see deadLetter).
+//
+// The fork uses the task's current retry_count, so pass the struct you got from
+// DequeueTask (it carries the up-to-date counts).
+func (s *TaskService) FailTask(task *models.Task, taskErr string) error {
+	if task.RetryCount < task.MaxRetries {
+		// Retry: back into the queue for another attempt. map-based Updates lets us
+		// write NULL into started_at/completed_at (struct Updates would skip them).
+		return s.db.Model(&models.Task{}).
+			Where("id = ?", task.ID).
+			Updates(map[string]any{
+				"status":        "pending",
+				"retry_count":   task.RetryCount + 1,
+				"error_message": taskErr,
+				"started_at":    nil,
+				"completed_at":  nil,
+			}).Error
+	}
+	return s.deadLetter(task, taskErr)
+}
+
+// deadLetter retires a task that has failed too many times. In one transaction it
+// (1) marks the original row "failed" with completed_at (keeps the tasks table as
+// the analytics source of truth) and (2) copies it into dead_letter_queue for
+// later inspection / manual retry. Doing both in a transaction keeps them
+// consistent — we never end up with one without the other.
+func (s *TaskService) deadLetter(task *models.Task, taskErr string) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		now := time.Now()
+
+		if err := tx.Model(&models.Task{}).
+			Where("id = ?", task.ID).
+			Updates(map[string]any{
+				"status":        "failed",
+				"error_message": taskErr,
+				"completed_at":  now,
+			}).Error; err != nil {
+			return err
+		}
+
+		dlq := models.DeadLetterTask{
+			OriginalTaskID: task.ID,
+			ClientID:       task.ClientID,
+			Type:           task.Type,
+			Priority:       task.Priority,
+			Payload:        task.Payload,
+			RetryCount:     task.RetryCount,
+			MaxRetries:     task.MaxRetries,
+			FinalError:     &taskErr,
+			ProcessedBy:    task.ProcessedBy,
+			CreatedAt:      task.CreatedAt, // preserve original submission time
+			FailedAt:       now,
+		}
+		return tx.Create(&dlq).Error
+	})
+}
+
 // GetTask fetches one task by id, but ONLY if it belongs to clientID. Scoping by
 // client_id is the authorization step: a client can never read another client's
 // task. If no row matches (wrong id OR not yours), GORM returns
@@ -172,24 +308,41 @@ func (s *TaskService) GetTask(clientID string, id uint64) (*models.Task, error) 
 // CancelTask transitions a task to "cancelled", but only if it's currently
 // pending or running (the state-machine rule). Scoped to clientID for ownership.
 //
-// Note: this reads-then-writes, so there's a small TOCTOU window where a worker
-// could pick up the task between our check and save. There are no workers yet
-// (Phase 3), and we'll harden this with a row lock / conditional UPDATE then.
+// This is a single atomic check-and-set: the WHERE clause GUARDS the transition
+// (status IN ('pending','running')) and the UPDATE applies it, all in one locked
+// operation. That closes the TOCTOU race the old read-then-save version had — now
+// that workers exist, a worker can no longer slip in and claim the row between our
+// check and our write, because there's no gap: the DB checks and writes together.
 func (s *TaskService) CancelTask(clientID string, id uint64) (*models.Task, error) {
+	now := time.Now()
+
+	// One guarded UPDATE. RowsAffected tells us whether the guard let it through.
+	res := s.db.Model(&models.Task{}).
+		Where("id = ? AND client_id = ? AND status IN ?", id, clientID, []string{"pending", "running"}).
+		Updates(map[string]any{
+			"status":       "cancelled",
+			"completed_at": now, // terminal state: record when it ended
+		})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+
+	if res.RowsAffected == 1 {
+		// Cancelled. Read the fresh row back so the caller gets the updated task.
+		var task models.Task
+		if err := s.db.Where("id = ? AND client_id = ?", id, clientID).First(&task).Error; err != nil {
+			return nil, err
+		}
+		return &task, nil
+	}
+
+	// RowsAffected == 0: the guard rejected the update. Figure out WHY so the
+	// controller can return the right status code.
 	var task models.Task
 	if err := s.db.Where("id = ? AND client_id = ?", id, clientID).First(&task).Error; err != nil {
-		return nil, err // ErrRecordNotFound -> 404 in the controller
+		return nil, err // ErrRecordNotFound -> 404 (wrong id, or not this client's)
 	}
-
-	if task.Status != "pending" && task.Status != "running" {
-		return nil, ErrTaskNotCancellable
-	}
-
-	now := time.Now()
-	task.Status = "cancelled"
-	task.CompletedAt = &now // terminal state: record when it ended
-	if err := s.db.Save(&task).Error; err != nil {
-		return nil, err
-	}
-	return &task, nil
+	// It exists and is ours, so the only reason the guard failed is that it was
+	// already in a terminal state (completed/failed/cancelled).
+	return nil, ErrTaskNotCancellable
 }

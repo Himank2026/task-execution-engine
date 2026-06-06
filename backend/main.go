@@ -8,6 +8,8 @@ import (
 	"github.com/Himank2026/task-execution-engine/backend/database"
 	"github.com/Himank2026/task-execution-engine/backend/logger"
 	"github.com/Himank2026/task-execution-engine/backend/routes"
+	"github.com/Himank2026/task-execution-engine/backend/services"
+	"github.com/Himank2026/task-execution-engine/backend/worker"
 )
 
 func main() {
@@ -45,7 +47,16 @@ func main() {
 	defer rdb.Close()
 	slog.Info("connected to Redis", "addr", cfg.RedisAddr)
 
-	r := routes.SetupRouter(db)
+	// One shared TaskService instance for BOTH the HTTP layer and the worker pool,
+	// so the API and the workers operate on the exact same business logic.
+	taskService := services.NewTaskService(db)
+
+	// Start the worker pool: N goroutines pulling pending tasks and running them.
+	pool := worker.NewPool(taskService, cfg.InstanceID, cfg.WorkerCount)
+	pool.Start()
+	defer pool.Stop() // graceful: when main returns, let in-flight workers finish
+
+	r := routes.SetupRouter(db, taskService)
 
 	addr := ":" + cfg.Port
 	slog.Info("starting server", "addr", addr, "instance", cfg.InstanceID)

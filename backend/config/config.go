@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 
 	"github.com/joho/godotenv"
 )
@@ -20,6 +21,10 @@ type Config struct {
 
 	RedisAddr     string
 	RedisPassword string
+
+	// WorkerCount is how many worker goroutines the pool spawns = the system's
+	// concurrency level. Defaults to 4 if WORKER_COUNT is unset.
+	WorkerCount int
 }
 
 // Load reads configuration from the environment, applying defaults for any
@@ -40,6 +45,8 @@ func Load() *Config {
 
 		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword: getEnv("REDIS_PASSWORD", ""),
+
+		WorkerCount: getEnvInt("WORKER_COUNT", 4),
 	}
 }
 
@@ -48,6 +55,17 @@ func Load() *Config {
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+// getEnvInt is the integer version of getEnv: it parses the env var as an int,
+// falling back if it's unset, empty, or not a valid number.
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return fallback
 }
