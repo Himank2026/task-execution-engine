@@ -5,7 +5,7 @@
 > not just wired libraries together. Each entry: **Problem → Solution → "the line you say"**,
 > plus likely follow-up questions for the meaty ones.
 >
-> Status: covers Phases 0–3. Append new sections as later phases land.
+> Status: covers Phases 0–4. Append new sections as later phases land.
 
 ---
 
@@ -15,6 +15,77 @@
 > over an API, the tasks live in a MySQL table that *is* the queue, a pool of worker
 > goroutines claims and runs them concurrently with `SELECT ... FOR UPDATE SKIP LOCKED`,
 > failures retry and then dead-letter, and a React dashboard watches it all live over SSE."
+
+---
+
+# Phase 4 — The scheduler (fairness / anti-starvation)
+
+## 0. Multi-tenant fairness — "one client floods the queue; how do the others not starve?"
+
+**(The distributed-systems story — shows I think about *fairness*, not just correctness.)**
+
+**Problem:** In Phase 3 the workers just claimed "the globally-next pending task" by priority. That's
+correct, but unfair: if Client A dumps 1,000 tasks and Client B submits 5 right after, B's tasks sit
+behind all 1,000 of A's. One noisy tenant starves everyone else — a classic multi-tenant problem.
+
+**Solution:** I split the decision in two and added a **scheduler** layer that runs **Deficit Round
+Robin (DRR)**:
+- **Fairness is decided in Go** — *which client* goes next. On a 250ms timer the scheduler cycles
+  through every client that has pending work and lets each dispatch up to a **quantum** of tasks per
+  round. So A and B take turns; A's flood can't jump ahead of B.
+- **Priority is still decided in SQL** — *which task within that client*. The per-client dequeue is
+  still `ORDER BY priority DESC, created_at ASC ... FOR UPDATE SKIP LOCKED`, scoped
+  `WHERE client_id = ?`.
+
+The "deficit" part: each client carries a `deficit` counter. Each round I add `quantum` to it and
+dispatch while it's positive. Leftover credit carries to the next round — that's what makes it fair
+when tasks have *different costs* (a client that could only afford a big job this round gets to use
+the carried credit next round). A client whose queue empties has its deficit reset to 0 so it can't
+hoard credit and jump the line when it comes back.
+
+**The line you say:** *"I separated fairness from priority. A DRR scheduler in Go decides which
+client dispatches next so no tenant starves; the database still decides which task within that client
+by priority. Fairness in Go, priority in SQL."*
+
+**Follow-ups:**
+- *Isn't this just round-robin?* → "With uniform task costs, yes — DRR degenerates to weighted
+  round-robin. The deficit mechanism earns its keep when tasks have heterogeneous costs: the carried
+  deficit lets a client 'save up' for work it couldn't afford in one round, which plain RR can't do."
+- *Why a timer instead of event-driven?* → "Simplicity and natural batching — every 250ms it does one
+  fair pass. The backpressure from the worker pool (a full channel blocks `Submit`) paces it so it
+  never over-dispatches."
+- *What stops two timer ticks from running passes at once?* → "An `isScheduling` mutex-guarded flag.
+  Each tick fires its pass in its own goroutine, so if a pass is slow (blocked on a full worker
+  queue), the next tick sees the flag and bows out. Exactly one pass runs at a time, so the
+  shared `deficits` map needs no further locking."
+- *Why decouple scheduler from the pool?* → "The scheduler depends on a tiny `Dispatcher` interface
+  (`Submit(task) bool`), not the concrete pool — so the two halves stay independent and testable."
+
+## 0b. Startup recovery of orphans — "a box dies mid-job; what happens to that task?"
+
+**Problem:** A task in `status='running'` means a worker claimed it. But if the *instance* crashes or
+restarts mid-job, the row is frozen at `running` forever — no live worker is actually running it. It's
+an **orphan**: claimed on paper, abandoned in reality. It would never complete and never retry.
+
+**Solution:** On startup, *before* the scheduler hands out any work, the instance requeues **its own**
+orphans — flips `running` rows back to `pending` and clears the timing/owner fields:
+```sql
+UPDATE tasks SET status='pending', started_at=NULL, processed_by=NULL
+WHERE status='running' AND processed_by = <this-instance-id>;
+```
+Two deliberate choices:
+- **Scoped to `processed_by = me`** — I only reclaim tasks *this* instance abandoned. Other instances'
+  `running` tasks might genuinely be in progress; stealing them would double-execute.
+- **No `retry_count++`** — the task didn't *fail*, the *process* died. Punishing the task's retry
+  budget for an infrastructure crash would be wrong, so it goes back to `pending` as good as new.
+
+**The line you say:** *"On boot I requeue orphaned `running` tasks back to `pending` — scoped to my
+own instance id so I don't steal live work, and without bumping the retry count because the task
+didn't fail, the instance did."*
+
+**Follow-up:**
+- *What about a worker that hangs but the instance is alive?* → "That needs a watchdog with a
+  heartbeat/timeout to detect stuck `running` tasks — Phase 5."
 
 ---
 
@@ -188,9 +259,9 @@ about Gin or HTTP, so the worker pool calls the exact same service methods the A
 
 # To add in later phases
 
-- **Phase 4 — Scheduler (Deficit Round Robin):** fair scheduling so one client can't starve others.
-- **Phase 5 — Fault tolerance:** startup recovery of orphaned `running` tasks, hung-worker watchdog,
-  graceful shutdown on SIGTERM.
+- **Phase 5 — Fault tolerance:** hung-worker watchdog (heartbeat/timeout), graceful shutdown on
+  SIGTERM (drain in-flight work). (Startup recovery of orphaned `running` tasks landed early in
+  Phase 4.)
 - **Phase 6+ — Rate limiting (Redis sliding window), SSE live updates, analytics queries, Docker
   Compose + nginx load balancing (the "distributed" proof: multiple backend instances sharing the
   queue via `processed_by`).**

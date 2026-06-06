@@ -161,43 +161,40 @@ func (s *TaskService) ListTasks(clientID string, f ListTasksFilter) (*ListTasksR
 	}, nil
 }
 
-// DequeueTask atomically claims the next pending task for this instance and marks
-// it running. It is the concurrency-safe heart of the system:
+// DequeueTaskForClient atomically claims the next pending task FOR ONE CLIENT and
+// marks it running. It is the concurrency-safe heart of the system:
 //
 //	BEGIN
 //	  SELECT ... FOR UPDATE SKIP LOCKED   -- claim one row, skip rows others hold
 //	  UPDATE ... SET status='running'     -- flip it, stamp who's running it
 //	COMMIT
 //
-// Because the SELECT locks the row and SKIP LOCKED steps over already-claimed
-// rows, no two workers (or backend instances) ever grab the same task. The lock
-// only exists inside the transaction, which is why both statements run in one.
+// Because the SELECT locks the row and SKIP LOCKED steps over already-claimed rows,
+// no two workers (or backend instances) ever grab the same task. The lock only
+// exists inside the transaction, which is why both statements run in one.
 //
-// Returns ErrNoTask when the queue is empty (a normal, expected condition).
-func (s *TaskService) DequeueTask(instanceID string) (*models.Task, error) {
+// It's scoped to a single client because the DRR scheduler decides FAIRNESS by
+// choosing which client to call this for; priority (ORDER BY) still rules WITHIN
+// that client's turn. Returns ErrNoTask when this client has no pending task.
+func (s *TaskService) DequeueTaskForClient(clientID, instanceID string) (*models.Task, error) {
 	var task models.Task
 
 	err := s.db.Transaction(func(tx *gorm.DB) error {
-		// Raw SQL on purpose: GORM has no first-class SKIP LOCKED, and we want the
-		// exact locking semantics visible. ORDER BY priority DESC, created_at ASC
-		// = highest priority first, oldest-first within a priority (FIFO).
 		result := tx.Raw(`
 			SELECT id, client_id, type, priority, payload, status, retry_count, max_retries, created_at
 			FROM tasks
-			WHERE status = 'pending'
+			WHERE status = 'pending' AND client_id = ?
 			ORDER BY priority DESC, created_at ASC
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
-		`).Scan(&task)
+		`, clientID).Scan(&task)
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
-			return ErrNoTask // queue empty
+			return ErrNoTask // this client has no pending task right now
 		}
 
-		// Same transaction: flip the claimed row to running so no one re-picks it
-		// after we COMMIT and release the lock.
 		now := time.Now()
 		if err := tx.Model(&models.Task{}).
 			Where("id = ?", task.ID).
@@ -209,7 +206,6 @@ func (s *TaskService) DequeueTask(instanceID string) (*models.Task, error) {
 			return err
 		}
 
-		// Reflect the changes in the returned struct (the SELECT read the old row).
 		task.Status = "running"
 		task.StartedAt = &now
 		task.ProcessedBy = &instanceID
@@ -219,6 +215,41 @@ func (s *TaskService) DequeueTask(instanceID string) (*models.Task, error) {
 		return nil, err
 	}
 	return &task, nil
+}
+
+// ClientsWithPendingTasks returns the distinct client_ids that currently have at
+// least one pending task. The scheduler uses this each round to know which clients
+// are "active" (have work) and therefore deserve a turn.
+func (s *TaskService) ClientsWithPendingTasks() ([]string, error) {
+	var clientIDs []string
+	err := s.db.Model(&models.Task{}).
+		Where("status = ?", "pending").
+		Distinct().
+		Pluck("client_id", &clientIDs).Error
+	if err != nil {
+		return nil, err
+	}
+	return clientIDs, nil
+}
+
+// RequeueOrphanedTasks is startup recovery: if THIS instance crashed last time, it
+// may have left tasks stuck in "running" that no worker is actually running anymore.
+// We flip them back to "pending" and clear the timing/owner fields so they get
+// cleanly re-claimed. Crucially we do NOT bump retry_count — the task didn't fail,
+// the instance died, so it shouldn't be penalized.
+//
+// Scoped to processed_by = instanceID so we only reclaim OUR own orphans — in a
+// multi-instance deployment we must not steal tasks another live instance is
+// legitimately running. (Cross-instance hang detection is the watchdog's job, Phase 5.)
+func (s *TaskService) RequeueOrphanedTasks(instanceID string) (int64, error) {
+	res := s.db.Model(&models.Task{}).
+		Where("status = ? AND processed_by = ?", "running", instanceID).
+		Updates(map[string]any{
+			"status":       "pending",
+			"started_at":   nil,
+			"processed_by": nil,
+		})
+	return res.RowsAffected, res.Error
 }
 
 // CompleteTask marks a successfully-run task as completed. completed_at is set so

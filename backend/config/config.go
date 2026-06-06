@@ -25,6 +25,11 @@ type Config struct {
 	// WorkerCount is how many worker goroutines the pool spawns = the system's
 	// concurrency level. Defaults to 4 if WORKER_COUNT is unset.
 	WorkerCount int
+
+	// SchedulerQuantum is how many tasks each client may dispatch per DRR round
+	// (its per-turn quota). Lower = stricter fairness; higher = more throughput per
+	// turn. Defaults to 2.
+	SchedulerQuantum int
 }
 
 // Load reads configuration from the environment, applying defaults for any
@@ -46,7 +51,8 @@ func Load() *Config {
 		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword: getEnv("REDIS_PASSWORD", ""),
 
-		WorkerCount: getEnvInt("WORKER_COUNT", 4),
+		WorkerCount:      getEnvInt("WORKER_COUNT", 4),
+		SchedulerQuantum: getEnvInt("SCHEDULER_QUANTUM", 2),
 	}
 }
 

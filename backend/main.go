@@ -8,6 +8,7 @@ import (
 	"github.com/Himank2026/task-execution-engine/backend/database"
 	"github.com/Himank2026/task-execution-engine/backend/logger"
 	"github.com/Himank2026/task-execution-engine/backend/routes"
+	"github.com/Himank2026/task-execution-engine/backend/scheduler"
 	"github.com/Himank2026/task-execution-engine/backend/services"
 	"github.com/Himank2026/task-execution-engine/backend/worker"
 )
@@ -47,14 +48,27 @@ func main() {
 	defer rdb.Close()
 	slog.Info("connected to Redis", "addr", cfg.RedisAddr)
 
-	// One shared TaskService instance for BOTH the HTTP layer and the worker pool,
-	// so the API and the workers operate on the exact same business logic.
+	// One shared TaskService instance for the HTTP layer, the worker pool, AND the
+	// scheduler — they all operate on the exact same business logic.
 	taskService := services.NewTaskService(db)
 
-	// Start the worker pool: N goroutines pulling pending tasks and running them.
+	// Startup recovery: requeue any tasks this instance left stuck in "running" from
+	// a previous crash, BEFORE the scheduler starts handing out work.
+	if n, err := taskService.RequeueOrphanedTasks(cfg.InstanceID); err != nil {
+		slog.Error("requeue orphaned tasks", "err", err)
+	} else if n > 0 {
+		slog.Info("requeued orphaned tasks", "count", n)
+	}
+
+	// Start the worker pool (execution): N goroutines running whatever they're given.
 	pool := worker.NewPool(taskService, cfg.InstanceID, cfg.WorkerCount)
 	pool.Start()
-	defer pool.Stop() // graceful: when main returns, let in-flight workers finish
+	defer pool.Stop() // runs second (LIFO): drain workers after scheduler stops
+
+	// Start the scheduler (fairness): DRR pass that feeds the pool fairly per client.
+	sched := scheduler.NewScheduler(taskService, pool, cfg.InstanceID, cfg.SchedulerQuantum)
+	sched.Start()
+	defer sched.Stop() // runs first (LIFO): stop submitting before the pool closes
 
 	r := routes.SetupRouter(db, taskService)
 
