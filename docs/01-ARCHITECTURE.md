@@ -48,14 +48,16 @@ A **client** submits a **task** via the API. The task is saved to a **MySQL tabl
 
 | Component | Job | Lives in |
 |-----------|-----|----------|
-| **API (Gin routes)** | Accept tasks, serve queries, expose SSE stream | `internal/api` |
-| **Task service** | Business logic: create/dequeue/complete/fail/retry tasks | `internal/task` |
-| **Scheduler** | Decide which task runs next, fairly (Deficit Round Robin) | `internal/scheduler` |
-| **Worker pool** | Run tasks concurrently; crash recovery; hung detection | `internal/worker` |
-| **Task handlers** | The actual (simulated) work per task type | `internal/worker/handlers` |
-| **Rate limiter** | Enforce 10 req/min/client globally | `internal/middleware` + Redis |
-| **SSE hub** | Hold open browser connections, broadcast events | `internal/sse` |
-| **Analytics** | Aggregate queries for the charts | `internal/analytics` |
+| **API (Gin routes + handlers)** | Accept tasks, serve queries, expose SSE stream | `routes/` + `controllers/` |
+| **Task service** | Business logic: create/dequeue/complete/fail/retry tasks | `services/` |
+| **Scheduler** | Decide which task runs next, fairly (Deficit Round Robin) | `scheduler/` |
+| **Worker pool** | Run tasks concurrently; crash recovery; hung detection | `worker/` |
+| **Task handlers** | The actual (simulated) work per task type | `worker/` |
+| **Rate limiter** | Enforce 10 req/min/client globally | `middleware/` + Redis |
+| **SSE hub** | Hold open browser connections, broadcast events | `sse/` |
+| **Analytics** | Aggregate queries for the charts | `services/` + `controllers/` |
+
+> **Layout note:** this project uses a **flat, package-per-folder layout** under `backend/` (`main.go` at the root with sibling packages above) — not the Go `cmd/`+`internal/` convention. Models live in `models/`, infra/connection + migration + seed in `database/`. See [03 — Backend](03-BACKEND.md) for the full tree.
 
 ## The 5 key design decisions (and the short "why")
 

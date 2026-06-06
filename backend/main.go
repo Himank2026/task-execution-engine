@@ -45,7 +45,7 @@ func main() {
 	defer rdb.Close()
 	slog.Info("connected to Redis", "addr", cfg.RedisAddr)
 
-	r := routes.SetupRouter()
+	r := routes.SetupRouter(db)
 
 	addr := ":" + cfg.Port
 	slog.Info("starting server", "addr", addr, "instance", cfg.InstanceID)

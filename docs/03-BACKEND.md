@@ -137,7 +137,9 @@ func EmailHandler(ctx context.Context, t Task) error {
 | GET | `/api/analytics/failure-rate` | Failure % over time |
 | GET | `/api/analytics/queue-wait` | Avg queue wait time |
 | GET | `/api/health` | Health + worker status |
-| POST | `/api/seed` | Seed test tasks |
+
+> Seeding is **not** an endpoint: test clients + sample tasks are inserted
+> automatically on startup (`database.Seed`, idempotent — only when the DB is empty).
 
 ## Graceful shutdown + startup recovery
 

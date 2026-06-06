@@ -86,11 +86,11 @@ VITE_API_BASE_URL=http://localhost:8080   # backend URL (the nginx LB URL in pro
 ## Dev commands (cheat sheet)
 
 ```bash
-# --- Backend ---
+# --- Backend --- (flat layout: main.go is at the backend root)
 cd backend
 go mod tidy                 # sync dependencies
-go run ./cmd/server         # run the server
-go build ./cmd/server       # compile
+go run .                    # run the server (migrates + seeds on startup)
+go build .                  # compile
 go test ./...               # run all tests
 go test -cover ./...        # tests + coverage %
 
@@ -109,12 +109,16 @@ docker compose up --build   # everything (http://localhost)
 
 ## First-run order (local)
 
-1. `docker compose up mysql redis -d` — start the databases.
-2. Run migrations (apply `backend/internal/db/migrations/*.sql`).
-3. `cd backend && go run ./cmd/server` — start the backend.
-4. `curl -X POST localhost:8080/api/seed` — load test tasks.
-5. `cd frontend && npm run dev` — start the dashboard.
-6. Open the dashboard, watch tasks process live.
+> Local dev uses Homebrew-managed MySQL + Redis (`brew services start mysql redis`),
+> not Docker. Docker is only used for the containerized/hosting path (Phase 9).
+
+1. Ensure MySQL + Redis are running (`brew services list`), and create the DB once:
+   `CREATE DATABASE task_engine;` (in Workbench or `mysql` CLI).
+2. `cd backend && go run .` — start the backend. On startup it **auto-migrates**
+   the tables (GORM `AutoMigrate`) and **auto-seeds** clients + sample tasks if the
+   DB is empty. No separate migration/seed step.
+3. `cd frontend && npm run dev` — start the dashboard.
+4. Open the dashboard, watch tasks process live.
 
 ## `.gitignore` essentials
 
