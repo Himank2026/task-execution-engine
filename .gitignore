@@ -1,0 +1,16 @@
+# secrets — never commit real env files
+.env
+*.env
+!.env.example
+
+# go
+/backend/server
+/backend/cmd/server/server
+*.test
+
+# node
+/frontend/node_modules
+/frontend/dist
+
+# os
+.DS_Store

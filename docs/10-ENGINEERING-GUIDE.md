@@ -95,11 +95,11 @@ A request flows **down** through layers, and each layer only knows about the one
         ▼
 ┌───────────────┐
 │  main.go      │  wiring only: load config, open DB/Redis, build deps, start server
-│ (cmd/server)  │  NO business logic here
+│ (backend root)│  NO business logic here
 └───────┬───────┘
         ▼
 ┌───────────────┐
-│  router       │  maps URL + method → handler; attaches middleware
+│  routes       │  maps URL + method → controller; attaches middleware
 └───────┬───────┘
         ▼
 ┌───────────────┐
@@ -107,53 +107,54 @@ A request flows **down** through layers, and each layer only knows about the one
 └───────┬───────┘
         ▼
 ┌───────────────┐
-│  handler      │  HTTP layer: parse/validate request → call service → format response
-│  (api)        │  NO business logic, NO SQL
+│  controller   │  HTTP layer: parse/validate request → call service → format response
+│ (controllers) │  NO business logic, NO SQL
 └───────┬───────┘
         ▼
 ┌───────────────┐
-│  service      │  business logic: rules, orchestration, decisions
-│               │  NO HTTP types, NO raw SQL
+│  service      │  business logic: rules, orchestration, decisions, + DB access
+│  (services)   │  NO HTTP types
 └───────┬───────┘
         ▼
 ┌───────────────┐
-│  repository   │  data access: ALL SQL lives here; returns models
-│  (store)      │  NO business rules
+│  (repository) │  OPTIONAL: isolate SQL here if services grow (deferred to Phase 2)
 └───────┬───────┘
         ▼
 ┌───────────────┐
 │  model        │  plain structs (Task, etc.) — the shared data shapes
-│  (types)      │
+│  (models)     │
 └───────┬───────┘
         ▼
      MySQL / Redis
 ```
 
-> You described `main → route → handler → service → model`. This is that exact flow, with one professional addition: a **repository** layer between service and model, so **SQL is isolated in one place** instead of scattered through business logic. This is the standard that keeps code testable and clean.
+> Our flow is exactly `main → routes → controllers → services → models`. SQL currently lives inside `services` to keep the layout simple. A dedicated **repository** layer (isolating all SQL between service and model) is an optional, professional refinement we may add in Phase 2 if the service files grow — it makes code more testable but adds a layer, so we add it only when it earns its place.
 
 ### Layer responsibilities (what goes where)
 
 | Layer | Does | Never does |
 |-------|------|------------|
-| **main.go** | Load config, open DB/Redis, construct services/handlers (dependency injection), start HTTP server + worker pool, handle graceful shutdown | Business logic, SQL, request handling |
-| **router** | Register routes, group by prefix, attach middleware | Logic of any kind |
+| **main.go** | Load config, open DB/Redis, construct services/controllers (dependency injection), start HTTP server + worker pool, handle graceful shutdown | Business logic, SQL, request handling |
+| **routes** | Register routes, group by prefix, attach middleware | Logic of any kind |
 | **middleware** | Auth, rate limiting, logging, panic recovery, request IDs | Business decisions |
-| **handler** | Read/validate input (JSON, query, path params), call **one** service method, map result/error to HTTP status + JSON | SQL, business rules, calling repositories directly |
-| **service** | The actual logic: validation rules, orchestration, retry decisions, calling repositories, emitting SSE events | Touching `http.Request`/`gin.Context`, writing raw SQL |
-| **repository** | Execute parameterized SQL, map rows → models, transactions (incl. `SKIP LOCKED`) | Business rules, HTTP concerns |
-| **model/types** | Define structs and shared types | Logic |
+| **controllers** | Read/validate input (JSON, query, path params), call **one** service method, map result/error to HTTP status + JSON | SQL, business rules |
+| **services** | The actual logic: validation rules, orchestration, retry decisions, parameterized SQL / DB access (incl. `SKIP LOCKED`), emitting SSE events | Touching `http.Request`/`gin.Context` |
+| **repository** *(optional, Phase 2)* | If added: execute parameterized SQL, map rows → models, transactions — moved out of services | Business rules, HTTP concerns |
+| **models** | Define structs and shared types | Logic |
 
 ### Concrete example — one feature top to bottom
 
 `POST /api/tasks` (submit a task):
 
-```go
-// 1. router.go — wire the route
-tasks := r.Group("/api/tasks", middleware.APIKey(authSvc), middleware.RateLimit(limiter))
-tasks.POST("", taskHandler.Create)
+> Note: the example below shows the optional **repository** variant for teaching. In our current 3-layer setup the `repo.Insert` SQL lives directly inside `services/task.go` instead of a separate repository package.
 
-// 2. handler/tasks.go — HTTP only
-func (h *TaskHandler) Create(c *gin.Context) {
+```go
+// 1. routes/task.go — wire the route
+tasks := r.Group("/api/tasks", middleware.APIKey(authSvc), middleware.RateLimit(limiter))
+tasks.POST("", taskController.Create)
+
+// 2. controllers/task.go — HTTP only
+func (h *TaskController) Create(c *gin.Context) {
     var req CreateTaskRequest
     if err := c.ShouldBindJSON(&req); err != nil {        // validate input
         c.JSON(http.StatusBadRequest, ErrorResponse{"invalid body"})
@@ -211,11 +212,10 @@ Notice: the handler never sees SQL, the repository never sees `gin.Context`, the
 Build dependencies in `main.go` and pass them **down** (inject), don't create them inside layers. This makes everything testable (you can pass a fake repo to a service in a test).
 
 ```go
-// main.go
-db := db.MustOpen(cfg)
-taskRepo := repository.NewTaskRepo(db)
-taskSvc  := service.NewTaskService(taskRepo, sseHub)
-taskH    := handler.NewTaskHandler(taskSvc)
+// main.go (backend root)
+db := database.MustOpen(cfg)
+taskSvc  := services.NewTaskService(db, sseHub)     // SQL lives in the service for now
+taskCtrl := controllers.NewTaskController(taskSvc)
 ```
 
 Services depend on **interfaces**, not concrete types, so they can be mocked:

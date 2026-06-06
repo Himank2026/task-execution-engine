@@ -4,49 +4,48 @@ This doc describes the Go backend: how it's organized, how the worker pool and s
 
 ---
 
-## Project structure (Go conventions)
+## Project structure
+
+We use a **flat, layer-per-folder** layout: `main.go` sits at the backend root, and each layer/concern is its own folder (= one Go package). Within each folder, one file per feature (e.g. `controllers/task.go`, `services/task.go`). The request flow is **main → routes → controllers → services → models**.
 
 ```
 backend/
-  cmd/
-    server/
-      main.go              ← entry point: load config, connect DB/Redis, start API + workers
-  internal/
-    config/                ← env var config with defaults
-    db/
-      mysql.go             ← MySQL connection pool (database/sql + driver)
-      migrations/          ← *.sql schema files
-      seed.go              ← generates ~60 test tasks across clients
-    redis/                 ← Redis client (go-redis) + error handling
-    types/                 ← shared structs: Task, SSEEvent, WorkerMessage, etc.
-    api/
-      router.go            ← Gin router setup, route registration
-      tasks.go             ← task CRUD + cancel + retry + DLQ endpoints
-      analytics.go         ← analytics endpoints (4 chart queries)
-      health.go            ← health check + worker status
-      sse.go               ← SSE stream endpoint
-    middleware/
-      apikey.go            ← API key auth (Redis-cached ~5min)
-      ratelimit.go         ← sliding-window rate limit (Redis + in-memory fallback)
-      errors.go            ← centralized error handling / JSON error responses
-    task/
-      service.go           ← create / dequeue / complete / fail / retry / requeue / cancel
-    scheduler/
-      scheduler.go         ← Deficit Round Robin loop; isScheduling guard
-    worker/
-      pool.go              ← worker pool: spawn, crash recovery, hung-worker watchdog
-      worker.go            ← a single worker: pull task, run handler, report result
-      handlers/            ← task handlers (simulated work) keyed by task type
-    sse/
-      hub.go               ← connection registry (map id→client), broadcast, heartbeat
-    analytics/
-      service.go           ← aggregate queries for charts
-  tests/                   ← unit + integration tests
+  main.go                  ← entry point: load config, connect DB/Redis, start API + workers
+  config/                  ← env var config with defaults
+  database/
+    mysql.go               ← MySQL connection pool (database/sql + driver)
+    redis.go               ← Redis client (go-redis) + error handling
+    migrations/            ← *.sql schema files
+    seed.go                ← generates ~60 test tasks across clients
+  models/                  ← shared structs: Task, SSEEvent, WorkerMessage, etc.
+  routes/
+    routes.go              ← Gin engine setup + route registration
+    task.go                ← task route group        (Phase 2)
+  controllers/
+    health.go              ← health check
+    task.go                ← task CRUD + cancel + retry + DLQ endpoints
+    analytics.go           ← analytics endpoints (4 chart queries)
+    sse.go                 ← SSE stream endpoint
+  services/
+    task.go                ← create / dequeue / complete / fail / retry / requeue / cancel
+    analytics.go           ← aggregate queries for charts
+  middleware/
+    apikey.go              ← API key auth (Redis-cached ~5min)
+    ratelimit.go           ← sliding-window rate limit (Redis + in-memory fallback)
+    errors.go              ← centralized error handling / JSON error responses
+  scheduler/
+    scheduler.go           ← Deficit Round Robin loop; isScheduling guard
+  worker/
+    pool.go                ← worker pool: spawn, crash recovery, hung-worker watchdog
+    worker.go              ← a single worker: pull task, run handler, report result
+    handlers/              ← task handlers (simulated work) keyed by task type
+  sse/
+    hub.go                 ← connection registry (map id→client), broadcast, heartbeat
   Dockerfile
   go.mod / go.sum
 ```
 
-> **Note on `internal/`:** Go treats packages under `internal/` as private to this module — a nice built-in way to signal "these aren't a public API." Standard convention.
+> **Layout notes:** Each folder is one Go package; cross-package calls use exported (Capitalized) names. `main.go` stays thin — it only wires dependencies and starts the server. SQL currently lives in `services/`; a dedicated `repository/` layer (isolating SQL) is an optional refinement we may add in Phase 2 if services grow. Most folders are created as we reach the phase that needs them, not up front.
 
 ## The concurrency model (Go's superpower here)
 
