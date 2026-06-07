@@ -252,6 +252,28 @@ func (s *TaskService) RequeueOrphanedTasks(instanceID string) (int64, error) {
 	return res.RowsAffected, res.Error
 }
 
+// FindStaleRunningTasks returns tasks stuck in "running" longer than timeout. A
+// healthy task finishes well within the timeout, so anything older than (now -
+// timeout) signals its worker hung or its instance died. The watchdog calls this on a
+// timer and then routes each one back through the failure path.
+//
+// Unlike RequeueOrphanedTasks (scoped to one instance, runs once at boot), this is
+// NOT scoped to an instance: a peer instance that died and never restarted leaves
+// stuck tasks only a *different* instance's watchdog can rescue. The timeout — set
+// comfortably larger than the longest real task — is what keeps us from reclaiming a
+// task that's merely slow but still alive.
+func (s *TaskService) FindStaleRunningTasks(timeout time.Duration) ([]models.Task, error) {
+	cutoff := time.Now().Add(-timeout)
+	var tasks []models.Task
+	err := s.db.
+		Where("status = ? AND started_at < ?", "running", cutoff).
+		Find(&tasks).Error
+	if err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
 // CompleteTask marks a successfully-run task as completed. completed_at is set so
 // throughput analytics (completions per time window) have a timestamp to count.
 func (s *TaskService) CompleteTask(id uint64) error {

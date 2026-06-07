@@ -5,7 +5,7 @@
 > not just wired libraries together. Each entry: **Problem → Solution → "the line you say"**,
 > plus likely follow-up questions for the meaty ones.
 >
-> Status: covers Phases 0–4. Append new sections as later phases land.
+> Status: covers Phases 0–4, plus Phase 5 graceful shutdown. Append new sections as later phases land.
 
 ---
 
@@ -15,6 +15,137 @@
 > over an API, the tasks live in a MySQL table that *is* the queue, a pool of worker
 > goroutines claims and runs them concurrently with `SELECT ... FOR UPDATE SKIP LOCKED`,
 > failures retry and then dead-letter, and a React dashboard watches it all live over SSE."
+
+---
+
+# Phase 5 — Fault tolerance
+
+## A. Graceful shutdown — "what happens to running work when you deploy/restart?"
+
+**Problem:** The server originally ended in `r.Run()`, which blocks forever. On Ctrl+C / SIGTERM
+(a deploy, a container restart) the OS **kills the process instantly** — every task mid-execution is
+abandoned, left stuck in `running` (an orphan), and all my cleanup `defer`s are skipped because
+`main()` never returns. That's lost work on every single restart.
+
+**Solution:** Catch the signal and shut down in a deliberate order instead of dying:
+1. Swapped `r.Run()` for a standard-library `http.Server` (it has a `Shutdown()` method; `r.Run()`
+   gives no handle to stop it). Run it in a goroutine so `main` can move on.
+2. `main` blocks on a channel fed by `signal.Notify(SIGINT, SIGTERM)`. The signal now lands in *my*
+   code instead of killing the process.
+3. On signal, shut down in order: **stop the HTTP server** (refuse new requests) → **stop the
+   scheduler** (stop handing out work) → **drain the worker pool** (let in-flight tasks *finish*) →
+   close Redis, close MySQL. That order is enforced by the **LIFO order of the `defer`s** in `main`.
+
+The subtle part is the **drain vs. abort** distinction in the pool. My first instinct (and the
+original Phase 3 code) cancelled a `context` on shutdown — but the handlers *watch* that context, so
+that would **cut tasks off mid-run** (they'd return an error and get wrongly counted as a retry). A
+true graceful stop **closes the task channel** instead; the workers `range` over it, so they finish
+everything already buffered or in-flight and *then* the loop ends. Closing the channel is safe only
+because the scheduler is guaranteed stopped first (the defer order), so nothing can `Submit` after
+the close and panic.
+
+**The line you say:** *"On SIGTERM I stop intake first, then drain in-flight work before closing —
+and the key detail is I drain by closing the work channel and letting workers finish, not by
+cancelling their context, so no in-flight task is cut off or wrongly retried. Zero loss on restart."*
+
+**Follow-ups:**
+- *How do you know it drained and didn't abort?* → "In the logs you see `task started`/`task completed`
+  lines printing *after* `shutdown signal received` — those are buffered/in-flight tasks finishing.
+  And `SELECT COUNT(*) WHERE status='running'` is 0 after exit: nothing left stranded."
+- *What if a task hangs forever during drain?* → "Right now drain waits on the WaitGroup. The
+  production hardening is a bounded drain — wait up to N seconds, then hard-cancel the stragglers
+  (which become orphans recovered on next boot). That pairs with the hung-worker watchdog."
+- *Why does ordering matter?* → "If I closed the pool before stopping the scheduler, the scheduler
+  could `Submit` to a closed channel and panic. Stop producers before consumers — always."
+
+## B. Durability — "a client submits a task, then the server crashes a second later. Lost?"
+
+**(Great 'do you understand durability' question — the answer is a crisp rule.)**
+
+**Problem:** Where exactly does a task become *safe*? If the server dies right after a client hits
+submit, does the task survive?
+
+**Solution / the mental model:** It depends on **whether the server acknowledged it**:
+- If the POST returned **`201 Created`**, the task was already **written to the MySQL `tasks` table as
+  `pending`** before I replied. The queue *is* that table, and it's on disk — **durable**. A crash/
+  restart just re-reads the table: `pending` tasks get scheduled, `running` tasks get orphan-recovered.
+  **Not lost.**
+- If the request **never got a `201`** (e.g. connection refused because the server was down), it was
+  **never written anywhere** — there's nothing to lose and nothing to recover. By the at-least-once
+  contract, **retrying is the client's responsibility.**
+
+**The line you say:** *"Acknowledgement is the durability boundary. Once I return 201 the task is in
+MySQL, so it survives any crash — pending tasks just run on restart, running tasks are orphan-
+recovered. Anything that never got a 201 was never accepted; the client retries. That's the
+at-least-once contract."*
+
+**Follow-up:**
+- *So could a task run twice?* → "Yes — at-least-once means a task acked but crashed mid-run gets
+  retried, so handlers should be idempotent. I chose at-least-once (never lose work) over at-most-once
+  (never duplicate); for a job queue, losing work is the worse failure."
+
+## C. Debugging story — "`go run` made graceful shutdown *look* broken"
+
+**Symptom:** On Ctrl+C the shell prompt appeared *in the middle* of the shutdown logs, so it looked
+like the server hung or didn't stop.
+
+**Cause:** `go run` is **two** processes — the `go run` wrapper *and* the compiled child binary. Ctrl+C
+goes to the whole foreground process group, so the wrapper quits immediately (the shell prints a fresh
+prompt) while the *real* server is still alive finishing its drain and logging to the same terminal.
+
+**Fix:** Run the built binary directly (`go build -o task-engine . && ./task-engine`) — one process,
+so Ctrl+C reaches the server, it drains, exits, and the prompt returns cleanly *after* all output.
+
+**The takeaway line:** *"It wasn't a shutdown bug — it was a `go run` signal-forwarding artifact. Worth
+knowing because in prod you ship the binary, not `go run`, so the real behaviour is the clean one."*
+
+## D. Panic recovery — "one task hits a bug and panics. What happens to the rest?"
+
+**(A Go-specific gotcha most people get wrong — strong signal you actually know the language.)**
+
+**Problem:** Each task runs inside a worker goroutine. In Go, an **unrecovered panic in *any*
+goroutine crashes the *entire* process** — not just that goroutine. So a single buggy task (nil
+dereference, bad type assertion, divide-by-zero) would take down the HTTP server and *all* the
+workers with it. One poisoned job = total outage.
+
+**Solution:** I wrap every handler call in a `recover()` safety net (`runHandler`). If the handler
+panics, I recover it, log it **with a full stack trace** (`debug.Stack()`), and convert the panic
+into a normal `error`. That error then flows down the existing **fail → retry → dead-letter** path,
+and crucially the **worker survives** and pulls the next task. A panic becomes "that one task
+failed," not "the engine died."
+
+```go
+func runHandler(ctx context.Context, handler Handler, task *models.Task) (err error) {
+    defer func() {
+        if r := recover(); r != nil {
+            slog.Error("recovered from handler panic", "task_id", task.ID, "panic", r,
+                "stack", string(debug.Stack()))
+            err = fmt.Errorf("handler panicked: %v", r)
+        }
+    }()
+    return handler(ctx, task)
+}
+```
+
+The detail that makes it work: the **named return value `(err error)`** — a deferred function can
+only change the function's result if the return is named, so that's how the recovered panic gets
+handed back as an error.
+
+**How I proved it:** added a chaos task type (`{"type":"panic"}`) that deliberately panics. Submitted
+one with `max_retries:2`: it panicked, got recovered and retried three times, then dead-lettered —
+and a normal task submitted right after **completed**, proving the pool lived through three panics.
+
+**The line you say:** *"A panic in a goroutine crashes the whole Go process, so every task runs behind
+a `recover()`. A panicking task is caught, logged with a stack trace, and routed through the normal
+retry/dead-letter path — the worker and the process stay up. I verified it with a chaos task type."*
+
+**Follow-ups:**
+- *Should a panic be retried like a normal failure?* → "I route it through retries, but a panic is
+  usually a deterministic bug, so it'll just re-panic until it dead-letters — which is fine: bounded
+  retries stop the loop and the DLQ captures it for inspection. You could also fast-path panics
+  straight to the DLQ."
+- *Where exactly is the recover?* → "Around the handler call only — not around my own
+  complete/fail bookkeeping. I want to catch *user task code* panics, not mask bugs in the engine."
 
 ---
 

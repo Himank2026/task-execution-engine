@@ -1,8 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/Himank2026/task-execution-engine/backend/config"
 	"github.com/Himank2026/task-execution-engine/backend/database"
@@ -10,6 +16,7 @@ import (
 	"github.com/Himank2026/task-execution-engine/backend/routes"
 	"github.com/Himank2026/task-execution-engine/backend/scheduler"
 	"github.com/Himank2026/task-execution-engine/backend/services"
+	"github.com/Himank2026/task-execution-engine/backend/watchdog"
 	"github.com/Himank2026/task-execution-engine/backend/worker"
 )
 
@@ -24,7 +31,11 @@ func main() {
 	}
 	// *gorm.DB has no Close(); reach the underlying *sql.DB to close the pool.
 	if sqlDB, err := db.DB(); err == nil {
-		defer sqlDB.Close()
+		defer func() {
+			slog.Info("closing mysql connection pool")
+			sqlDB.Close()
+			slog.Info("mysql connection pool closed")
+		}()
 	}
 	slog.Info("connected to MySQL", "host", cfg.DBHost, "port", cfg.DBPort, "db", cfg.DBName)
 
@@ -45,7 +56,11 @@ func main() {
 		slog.Error("connect redis", "err", err)
 		os.Exit(1)
 	}
-	defer rdb.Close()
+	defer func() {
+		slog.Info("closing redis connection")
+		rdb.Close()
+		slog.Info("redis connection closed")
+	}()
 	slog.Info("connected to Redis", "addr", cfg.RedisAddr)
 
 	// One shared TaskService instance for the HTTP layer, the worker pool, AND the
@@ -68,14 +83,54 @@ func main() {
 	// Start the scheduler (fairness): DRR pass that feeds the pool fairly per client.
 	sched := scheduler.NewScheduler(taskService, pool, cfg.InstanceID, cfg.SchedulerQuantum)
 	sched.Start()
-	defer sched.Stop() // runs first (LIFO): stop submitting before the pool closes
+	defer sched.Stop() // runs second-to-first (LIFO): stop submitting before the pool closes
+
+	// Start the watchdog (liveness): periodically requeues tasks stuck in "running"
+	// past the timeout (a hung worker, or a peer instance that died).
+	wd := watchdog.NewWatchdog(taskService, cfg.WatchdogInterval, cfg.WatchdogTimeout)
+	wd.Start()
+	defer wd.Stop() // runs first (LIFO): stop reclaiming before we drain on shutdown
 
 	r := routes.SetupRouter(db, taskService)
 
-	addr := ":" + cfg.Port
-	slog.Info("starting server", "addr", addr, "instance", cfg.InstanceID)
-	if err := r.Run(addr); err != nil {
-		slog.Error("server failed", "err", err)
-		os.Exit(1)
+	// Wrap the Gin router in a standard-library http.Server. r.Run() blocks forever and
+	// gives us no way to stop it; an http.Server hands us Shutdown() for a clean,
+	// drain-in-flight stop.
+	srv := &http.Server{
+		Addr:    ":" + cfg.Port,
+		Handler: r,
 	}
+
+	// Run the server in its own goroutine so main can move past it and sit waiting for a
+	// shutdown signal. ListenAndServe blocks until the server stops; a clean Shutdown
+	// makes it return http.ErrServerClosed, which is expected — not a real error.
+	go func() {
+		slog.Info("starting server", "addr", srv.Addr, "instance", cfg.InstanceID)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server failed", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	// Block here until the OS asks us to stop. signal.Notify routes Ctrl+C (SIGINT) and
+	// `kill`/orchestrator stop (SIGTERM) into this channel instead of letting them kill
+	// the process instantly — that's what gives us the chance to shut down cleanly.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	slog.Info("shutdown signal received, shutting down gracefully")
+
+	// Stop the HTTP server first: refuse new connections, let in-flight requests finish
+	// (up to 10s). After this, no new tasks can enter via the API.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Error("http server shutdown", "err", err)
+	}
+	slog.Info("http server stopped")
+
+	// Returning now runs the deferred Stop()/Close() calls in LIFO order:
+	//   scheduler.Stop() (stop submitting) → pool.Stop() (drain workers) →
+	//   redis.Close() → mysql.Close().
+	// That ordering IS the graceful drain.
 }

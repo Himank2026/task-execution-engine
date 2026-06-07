@@ -2,7 +2,9 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 
 	"github.com/Himank2026/task-execution-engine/backend/models"
@@ -72,30 +74,30 @@ func (p *Pool) Submit(task *models.Task) bool {
 	}
 }
 
-// Stop signals shutdown and waits for all workers to finish. We cancel the context
-// (workers stop pulling, in-flight handlers abort) rather than closing the channel,
-// so a late Submit can never panic on a closed channel.
+// Stop performs a GRACEFUL drain: it stops accepting new work and lets the workers
+// finish everything already buffered or in-flight, then exits. We close the queue
+// (rather than cancelling the context) so workers drain the buffer and finish their
+// current task naturally — nothing in-flight is cut off, so no task is lost or
+// wrongly counted as a retry.
 //
-// Contract: stop the SCHEDULER before calling this, so nothing is still Submitting.
+// Closing the queue is safe ONLY because the scheduler is stopped before us (see the
+// defer order in main.go), so nothing can Submit after the close and panic.
 func (p *Pool) Stop() {
-	slog.Info("worker pool stopping")
-	p.cancel()
-	p.wg.Wait()
+	slog.Info("worker pool stopping, draining in-flight tasks")
+	close(p.queue) // no more new work; workers will drain what's left
+	p.wg.Wait()    // block until every worker has finished and returned
+	p.cancel()     // all workers done — release the context
 	slog.Info("worker pool stopped")
 }
 
-// worker is one consumer. It pulls tasks until the context is cancelled. We select
-// on ctx.Done() too (not just range) so a worker can exit promptly on shutdown even
-// if no task ever arrives.
+// worker is one consumer. It ranges over the queue: it runs tasks as they arrive and
+// exits automatically once the queue is closed AND fully drained — that's what makes
+// Stop's clean drain work. We deliberately don't watch ctx here, so a task that's
+// already running is allowed to finish on shutdown instead of being cut off.
 func (p *Pool) worker(id int) {
 	defer p.wg.Done()
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case task := <-p.queue:
-			p.process(id, task)
-		}
+	for task := range p.queue {
+		p.process(id, task)
 	}
 }
 
@@ -107,7 +109,7 @@ func (p *Pool) process(workerID int, task *models.Task) {
 		"type", task.Type, "priority", task.Priority)
 
 	handler := handlerFor(task.Type)
-	err := handler(p.ctx, task)
+	err := runHandler(p.ctx, handler, task)
 
 	if err != nil {
 		if ferr := p.tasks.FailTask(task, err.Error()); ferr != nil {
@@ -125,4 +127,24 @@ func (p *Pool) process(workerID int, task *models.Task) {
 		return
 	}
 	slog.Info("task completed", "worker", workerID, "task_id", task.ID, "client", task.ClientID)
+}
+
+// runHandler runs a task's handler behind a panic safety net. Without this, a panic
+// in handler code would crash the ENTIRE process — an unrecovered panic in any
+// goroutine takes the whole program down, not just that one worker. We recover it,
+// log it (with a stack trace for debugging), and turn it into a normal error so the
+// task follows the usual fail → retry → dead-letter path, and the worker lives on to
+// run the next task.
+//
+// The named return value (err) is what lets the deferred recover hand an error back
+// to the caller in place of the panic.
+func runHandler(ctx context.Context, handler Handler, task *models.Task) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("recovered from handler panic",
+				"task_id", task.ID, "panic", r, "stack", string(debug.Stack()))
+			err = fmt.Errorf("handler panicked: %v", r)
+		}
+	}()
+	return handler(ctx, task)
 }

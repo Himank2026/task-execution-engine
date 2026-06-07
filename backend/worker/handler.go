@@ -35,9 +35,20 @@ func simulatedWork(ctx context.Context, task *models.Task) error {
 	return nil
 }
 
-// handlerFor returns the handler for a task type. Today every type uses the same
-// simulated handler; this is the seam where real per-type handlers (send_email,
-// resize_image, ...) would be registered.
+// handlerFor returns the handler for a task type. Most types use the same simulated
+// handler; this is the seam where real per-type handlers (send_email, resize_image,
+// ...) would be registered.
+//
+// The "panic" type is a deliberate chaos handler: it lets us verify that the pool's
+// panic recovery keeps the worker (and the whole process) alive. Submit a task with
+// {"type":"panic"} to exercise it.
 func handlerFor(taskType string) Handler {
-	return simulatedWork
+	switch taskType {
+	case "panic":
+		return func(ctx context.Context, task *models.Task) error {
+			panic("simulated handler panic (chaos test)")
+		}
+	default:
+		return simulatedWork
+	}
 }

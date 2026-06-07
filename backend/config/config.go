@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -30,6 +31,14 @@ type Config struct {
 	// (its per-turn quota). Lower = stricter fairness; higher = more throughput per
 	// turn. Defaults to 2.
 	SchedulerQuantum int
+
+	// WatchdogInterval is how often the watchdog scans for stuck tasks. Default 15s.
+	WatchdogInterval time.Duration
+
+	// WatchdogTimeout is how long a task may sit in "running" before the watchdog
+	// treats it as hung/crashed and requeues it. Must be comfortably larger than the
+	// longest real task so a merely-slow task isn't wrongly reclaimed. Default 60s.
+	WatchdogTimeout time.Duration
 }
 
 // Load reads configuration from the environment, applying defaults for any
@@ -53,6 +62,9 @@ func Load() *Config {
 
 		WorkerCount:      getEnvInt("WORKER_COUNT", 4),
 		SchedulerQuantum: getEnvInt("SCHEDULER_QUANTUM", 2),
+
+		WatchdogInterval: getEnvSeconds("WATCHDOG_INTERVAL_SECONDS", 15),
+		WatchdogTimeout:  getEnvSeconds("WATCHDOG_TIMEOUT_SECONDS", 60),
 	}
 }
 
@@ -74,4 +86,10 @@ func getEnvInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// getEnvSeconds reads an int env var as a number of SECONDS and returns it as a
+// time.Duration (so config stays simple ints like WATCHDOG_TIMEOUT_SECONDS=10).
+func getEnvSeconds(key string, fallbackSeconds int) time.Duration {
+	return time.Duration(getEnvInt(key, fallbackSeconds)) * time.Second
 }
