@@ -5,7 +5,7 @@
 > not just wired libraries together. Each entry: **Problem → Solution → "the line you say"**,
 > plus likely follow-up questions for the meaty ones.
 >
-> Status: covers Phases 0–6 (backend complete). Append new sections as later phases land.
+> Status: covers Phases 0–7 (backend + React dashboard). Append new sections as later phases land.
 
 ---
 
@@ -15,6 +15,91 @@
 > over an API, the tasks live in a MySQL table that *is* the queue, a pool of worker
 > goroutines claims and runs them concurrently with `SELECT ... FOR UPDATE SKIP LOCKED`,
 > failures retry and then dead-letter, and a React dashboard watches it all live over SSE."
+
+---
+
+# Phase 7 — The React dashboard (frontend)
+
+## A. Consuming SSE in the browser — "how does the dashboard get live updates?"
+
+**Problem:** The backend pushes task events over SSE, and the dashboard needs to render them live. The
+obvious tool is the browser's built-in `EventSource` — but it has a hard limitation: **it can't send
+custom request headers.** Our API authenticates with an `x-api-key` header, so `EventSource` literally
+can't authenticate to our stream.
+
+**Solution:** I used `@microsoft/fetch-event-source` — a fetch-based SSE client that *does* support
+headers (and auto-reconnect). My `useSSE` hook opens the stream with the `x-api-key` header, tracks a
+`connected` flag (for the "Live / Connecting…" badge), filters out heartbeats, and keeps the newest N
+events in state. One important option: `openWhenHidden: true`, so switching browser tabs doesn't drop
+and reconnect the stream.
+
+**The line you say:** *"The native EventSource can't set headers, and my API auth is header-based, so I
+used fetch-event-source instead — same SSE semantics but with auth headers and auto-reconnect."*
+
+**Follow-ups:**
+- *What does "Connecting…" mean?* → "It's the handshake state — the gap between firing the request and
+  the server confirming a `text/event-stream` response. If it sticks, the stream is being rejected
+  (bad key, rate limit, server down) and the client is retrying."
+
+## B. No CORS pain — "frontend on :5173, backend on :8080. How do they talk?"
+
+**Problem:** Different ports = different origins = CORS. The browser would block the calls.
+
+**Solution:** A **Vite dev proxy** forwards `/api/*` to `localhost:8080`, so to the browser it's all one
+origin — no CORS, and zero backend changes. In production, nginx serves the built frontend and proxies
+`/api` the same way. So the frontend code just calls `/api/...` and never thinks about origins.
+
+**The line you say:** *"Same-origin via a dev proxy (and nginx in prod), so I never had to add CORS
+handling — the browser always sees one origin."*
+
+## C. The live worker panel — "polling vs streaming, and a multi-tenant subtlety"
+
+**Problem:** I wanted the dashboard to show each of the N workers and what it's running *right now*.
+
+**Solution:** The pool tracks per-worker live state (`setBusy`/`setIdle` around each task), exposed via
+`GET /api/workers`; the dashboard polls it every second. I chose **polling over SSE here** because
+worker state is a small fixed-size snapshot that's cheap to fetch, and "the state as of now" is exactly
+what a 1s poll gives — no event bookkeeping needed.
+
+**The honest subtlety:** the SSE *task feed* is filtered per-client (multi-tenant), but the workers are
+**shared across all clients**. A per-client view can't show true global worker state, so the worker
+panel is deliberately a **global/ops view** (it shows whichever client's task is on each worker). I can
+defend that as an admin/ops surface; a stricter design would scope it or label cross-tenant tasks.
+
+**The line you say:** *"Worker state is a tiny live snapshot, so I poll it once a second rather than
+stream it. I treat the worker panel as a global ops view, since the pool is shared across tenants."*
+
+## D. Charts: aggregates vs per-task vs time-series — "what can you actually plot?"
+
+**Problem:** I wanted real charts (throughput, latency), but the analytics endpoint only returned
+*averages* — and you can't plot a trend from a single average.
+
+**Solution:** Three different data shapes for three chart needs:
+- **Status distribution** (donut) — from the aggregate counts.
+- **Latency per task** (queue wait vs execution) — computed **in the browser** from each task's
+  `created_at`/`started_at`/`completed_at` in the existing `/api/tasks` data. No new endpoint.
+- **Throughput over time** (area) — this one genuinely needed a new **time-series endpoint**
+  (`/api/analytics/throughput`) that buckets completions into **10-second** slots (not minutes, so a
+  short burst still draws a curve). Two backend details: I keyed the buckets by **UNIX epoch seconds**
+  (timezone-independent) so zero-filling empty buckets in Go doesn't hit a Go/MySQL timezone mismatch.
+
+**The line you say:** *"Aggregates give you distributions, per-row data gives you per-task charts, and
+trends-over-time need a time-bucketed endpoint. I bucketed by 10s keyed on UNIX epochs so zero-filling
+gaps stays timezone-safe."*
+
+## E. A rate-limit lesson the dashboard taught me — "one limit doesn't fit all endpoints"
+
+**Problem:** With a 10-req/min limit, the dashboard **rate-limited itself** — polling `/api/analytics`
+every 5s plus the SSE connection blew past 10/min, so it got 429s and the live badge stuck on
+"Connecting…".
+
+**Solution:** Raised the default to 120/min, and made the limiter **ignore `context.Canceled`** (a
+disconnecting SSE client isn't an error). The deeper lesson: an abuse-protection limit sized for
+*writes* shouldn't throttle a dashboard's *reads* — real systems tune limits per endpoint or per route
+group.
+
+**The line you say:** *"My own dashboard tripped my rate limiter, which taught me limits should be
+per-endpoint — read-heavy dashboard polling and write abuse-protection are different budgets."*
 
 ---
 
