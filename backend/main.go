@@ -86,6 +86,12 @@ func main() {
 	pool.Start()
 	defer pool.Stop() // runs second (LIFO): drain workers after scheduler stops
 
+	// Worker registry: heartbeat this instance's worker state to Redis so the dashboard
+	// can show ALL instances' workers, not just this one.
+	registry := worker.NewRegistry(rdb, pool)
+	registry.Start()
+	defer registry.Stop()
+
 	// Start the scheduler (fairness): DRR pass that feeds the pool fairly per client.
 	sched := scheduler.NewScheduler(taskService, pool, cfg.InstanceID, cfg.SchedulerQuantum)
 	sched.Start()
@@ -100,7 +106,7 @@ func main() {
 	// Per-client API rate limiter (sliding window, backed by Redis).
 	limiter := ratelimit.NewLimiter(rdb, cfg.RateLimitMax, cfg.RateLimitWindow)
 
-	r := routes.SetupRouter(db, taskService, limiter, hub, pool)
+	r := routes.SetupRouter(db, taskService, limiter, hub, registry)
 
 	// Wrap the Gin router in a standard-library http.Server. r.Run() blocks forever and
 	// gives us no way to stop it; an http.Server hands us Shutdown() for a clean,

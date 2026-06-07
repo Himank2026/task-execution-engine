@@ -1,0 +1,4 @@
+# Keep the build context small — don't ship the compiled binary, logs, or env files.
+task-engine
+*.log
+.env

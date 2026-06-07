@@ -83,8 +83,16 @@ curl -s -X POST http://localhost:8080/api/tasks \
   -H "x-api-key: key-alpha" -H "Content-Type: application/json" \
   -d '{"type":"panic","priority":3,"max_retries":2}'
 
+# Submit a BATCH of tasks in one request (one bulk insert)
+curl -s -X POST http://localhost:8080/api/tasks/batch \
+  -H "x-api-key: key-alpha" -H "Content-Type: application/json" \
+  -d '{"tasks":[{"type":"send_email","priority":3},{"type":"send_sms","priority":1}]}'
+
 # List your tasks (GET; auth header still required)
 curl -s http://localhost:8080/api/tasks -H "x-api-key: key-alpha"
+
+# List ALL clients' tasks (dashboard ops view), filtered + paginated
+curl -s "http://localhost:8080/api/tasks?all=true&client=beta&type=send_email&page=1&page_size=20" -H "x-api-key: key-alpha"
 
 # Get one task by id
 curl -s http://localhost:8080/api/tasks/143 -H "x-api-key: key-alpha"
@@ -235,4 +243,49 @@ mysql -u root task_engine -e "SELECT id, type, status FROM tasks ORDER BY id DES
 
 ---
 
-*Living document — add new tools/commands here as the project grows (Docker, redis-cli, etc.).*
+---
+
+## 6. Running multiple backend instances (distributed mode)
+
+A backend instance is just the binary with a unique `INSTANCE_ID` + `PORT`. Run several pointed at the
+**same MySQL + Redis** and they share the queue. `SELECT ... FOR UPDATE SKIP LOCKED` stops any two from
+grabbing the same task, so it's safe with no extra coordination.
+
+```bash
+# build once
+cd backend && go build -o task-engine .
+
+# Terminal 1
+INSTANCE_ID=backend-1 PORT=8080 LOG_FORMAT=text ./task-engine
+# Terminal 2 (reuses the binary)
+INSTANCE_ID=backend-2 PORT=8081 LOG_FORMAT=text ./task-engine
+# Terminal 3
+INSTANCE_ID=backend-3 PORT=8082 LOG_FORMAT=text ./task-engine
+```
+
+The dashboard talks to `:8080`, but its **Workers** panel shows ALL instances — because each instance
+heartbeats its worker state into Redis (`workers:<instance>`, 6s TTL) and `GET /api/workers` merges
+them. Stop an instance → it drops off the panel in ~6s (its key expires).
+
+## 7. `redis-cli` — peeking inside Redis
+
+Redis is the shared "whiteboard" the instances coordinate through. To look inside:
+
+```bash
+redis-cli                              # open the Redis prompt (Ctrl+D to exit)
+
+# the per-instance worker snapshots (the registry):
+redis-cli KEYS 'workers:*'             # which instances are alive
+redis-cli GET workers:backend-1        # one instance's worker JSON
+redis-cli TTL workers:backend-1        # seconds until it expires (the heartbeat)
+
+# the rate-limiter sorted sets (one per client):
+redis-cli KEYS 'ratelimit:*'
+redis-cli ZCARD ratelimit:alpha        # how many requests in alpha's current window
+```
+
+(`redis-cli` ships with Redis; if missing, `brew install redis`.)
+
+---
+
+*Living document — add new tools/commands here as the project grows (Docker, etc.).*

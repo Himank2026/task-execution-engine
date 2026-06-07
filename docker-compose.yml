@@ -1,0 +1,95 @@
+# The full DISTRIBUTED stack: 3 backend instances + nginx load balancer + mysql + redis.
+# Run it with:
+#     docker compose up --build
+# Then open http://localhost:8080
+#
+# All three backends share one MySQL + one Redis. SELECT ... FOR UPDATE SKIP LOCKED
+# means they never grab the same task, so work spreads across all 12 workers (3×4) with
+# no coordination code. nginx round-robins the API across them.
+
+# --- shared bits, reused by all three backends (YAML anchors keep it DRY) ---
+x-backend-env: &backend-env
+  PORT: "8080"
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_USER: root
+  DB_PASSWORD: taskpass
+  DB_NAME: task_engine
+  REDIS_ADDR: redis:6379
+  LOG_FORMAT: text
+
+x-backend-health: &backend-health
+  test: ["CMD-SHELL", "wget -q -O - http://localhost:8080/api/health || exit 1"]
+  interval: 5s
+  timeout: 3s
+  retries: 20
+
+services:
+  # --- infrastructure ---
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: taskpass
+      MYSQL_DATABASE: task_engine
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptaskpass"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --- backend instance 1 (migrates + seeds first, so 2 and 3 don't race the seed) ---
+  backend1:
+    build: ./backend
+    environment:
+      <<: *backend-env
+      INSTANCE_ID: backend-1
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck: *backend-health
+
+  # --- backend instances 2 & 3 (start only after backend1 is up = schema + seed done) ---
+  backend2:
+    build: ./backend
+    environment:
+      <<: *backend-env
+      INSTANCE_ID: backend-2
+    depends_on:
+      backend1:
+        condition: service_healthy
+    healthcheck: *backend-health
+
+  backend3:
+    build: ./backend
+    environment:
+      <<: *backend-env
+      INSTANCE_ID: backend-3
+    depends_on:
+      backend1:
+        condition: service_healthy
+    healthcheck: *backend-health
+
+  # --- nginx: serves the React app + load-balances /api across the 3 backends ---
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80" # browse the dashboard at http://localhost:8080
+    depends_on:
+      - backend1
+      - backend2
+      - backend3
+
+volumes:
+  mysql_data:

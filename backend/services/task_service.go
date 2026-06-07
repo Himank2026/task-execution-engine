@@ -64,6 +64,30 @@ func (s *TaskService) CreateTask(clientID string, in CreateTaskInput) (*models.T
 	return task, nil
 }
 
+// BatchCreateTasks inserts many tasks for a client in ONE bulk insert — far cheaper
+// than N separate round-trips when submitting a burst.
+func (s *TaskService) BatchCreateTasks(clientID string, inputs []CreateTaskInput) (int, error) {
+	tasks := make([]models.Task, 0, len(inputs))
+	for _, in := range inputs {
+		t := models.Task{
+			ClientID:   clientID,
+			Type:       in.Type,
+			Priority:   in.Priority,
+			Payload:    in.Payload,
+			Status:     "pending",
+			MaxRetries: 3,
+		}
+		if in.MaxRetries != nil {
+			t.MaxRetries = *in.MaxRetries
+		}
+		tasks = append(tasks, t)
+	}
+	if err := s.db.Create(&tasks).Error; err != nil {
+		return 0, err
+	}
+	return len(tasks), nil
+}
+
 // allowedSortColumns is the whitelist for the `sort_by` query param. A sort
 // column can't be a parameterized `?` placeholder — it becomes part of the SQL
 // text — so we ONLY ever allow these exact strings. Anything else falls back to
@@ -85,6 +109,11 @@ type ListTasksFilter struct {
 	PageSize int
 	SortBy   string
 	Order    string
+	// AllClients, when true, skips the per-client scoping (ops/dashboard view).
+	AllClients bool
+	// FilterClient, when set, narrows the list to one specific client (used by the
+	// dashboard's client filter on top of the all-clients view).
+	FilterClient string
 }
 
 // ListTasksResult is the page of tasks plus the metadata a UI needs to paginate.
@@ -100,10 +129,17 @@ type ListTasksResult struct {
 // Everything is scoped to clientID (multi-tenant isolation), filter values use
 // `?` placeholders (injection-safe), and the sort column is whitelisted.
 func (s *TaskService) ListTasks(clientID string, f ListTasksFilter) (*ListTasksResult, error) {
-	// Base query: always scoped to this client.
-	q := s.db.Model(&models.Task{}).Where("client_id = ?", clientID)
+	// Base query: scoped to this client, UNLESS the caller asked for all clients
+	// (the dashboard's ops view).
+	q := s.db.Model(&models.Task{})
+	if !f.AllClients {
+		q = q.Where("client_id = ?", clientID)
+	}
 
 	// Add a WHERE only for filters that were actually provided.
+	if f.FilterClient != "" {
+		q = q.Where("client_id = ?", f.FilterClient)
+	}
 	if f.Status != "" {
 		q = q.Where("status = ?", f.Status)
 	}
@@ -196,19 +232,20 @@ func (s *TaskService) DequeueTaskForClient(clientID, instanceID string) (*models
 			return ErrNoTask // this client has no pending task right now
 		}
 
-		now := time.Now()
+		// Mark it running + stamp the owner, but DON'T set started_at here. started_at is
+		// set when a WORKER actually begins the handler (MarkStarted), so "execution
+		// time" is the pure handler runtime and "queue wait" is the full time until work
+		// began (including any brief in-buffer wait under load).
 		if err := tx.Model(&models.Task{}).
 			Where("id = ?", task.ID).
 			Updates(map[string]any{
 				"status":       "running",
-				"started_at":   now,
 				"processed_by": instanceID,
 			}).Error; err != nil {
 			return err
 		}
 
 		task.Status = "running"
-		task.StartedAt = &now
 		task.ProcessedBy = &instanceID
 		return nil
 	})
@@ -275,32 +312,51 @@ func (s *TaskService) FindStaleRunningTasks(timeout time.Duration) ([]models.Tas
 	return tasks, nil
 }
 
-// ResetDemoData is a DEV/DEMO helper: in one transaction it deletes the calling
-// client's tasks and dead-letter rows, then inserts n fresh random PENDING tasks. This
-// lets a demo start from a clean, predictable dataset without the table growing every
-// run. Scoped to clientID, so it never affects another tenant.
-func (s *TaskService) ResetDemoData(clientID string, n int) error {
+// AddDemoTasks is a DEV/DEMO helper: it APPENDS n fresh random PENDING tasks spread
+// across all active clients. It does NOT wipe — clicking "Demo data" again adds another
+// batch, so the totals grow (50 → 100 → 150). Use ClearAllData to reset to empty.
+// Spreading across clients makes the multi-tenant behaviour visible (mix of
+// alpha/beta/gamma in the worker panel and task list).
+func (s *TaskService) AddDemoTasks(n int) error {
 	demoTypes := []string{"send_email", "send_sms", "generate_report", "resize_image"}
 
-	return s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("client_id = ?", clientID).Delete(&models.Task{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Where("client_id = ?", clientID).Delete(&models.DeadLetterTask{}).Error; err != nil {
-			return err
-		}
+	// Which clients exist? Spread the demo tasks across them.
+	var clientIDs []string
+	if err := s.db.Model(&models.APIKey{}).Where("active = ?", true).Pluck("client_id", &clientIDs).Error; err != nil {
+		return err
+	}
+	if len(clientIDs) == 0 {
+		clientIDs = []string{"alpha"} // fallback so the demo still works
+	}
 
-		tasks := make([]models.Task, 0, n)
-		for i := 0; i < n; i++ {
-			tasks = append(tasks, models.Task{
-				ClientID:   clientID,
-				Type:       demoTypes[rand.Intn(len(demoTypes))],
-				Priority:   uint8(rand.Intn(5) + 1),
-				Status:     "pending",
-				MaxRetries: 3,
-			})
+	tasks := make([]models.Task, 0, n)
+	for i := 0; i < n; i++ {
+		tasks = append(tasks, models.Task{
+			ClientID:   clientIDs[rand.Intn(len(clientIDs))],
+			Type:       demoTypes[rand.Intn(len(demoTypes))],
+			Priority:   uint8(rand.Intn(5) + 1),
+			Status:     "pending",
+			MaxRetries: 3,
+		})
+	}
+	return s.db.Create(&tasks).Error
+}
+
+// MarkStarted stamps started_at at the moment a worker actually begins running the
+// task (vs when the scheduler claimed it). This makes execution time = pure handler
+// runtime, and queue wait = the full time from submission until work began.
+func (s *TaskService) MarkStarted(id uint64) error {
+	return s.db.Model(&models.Task{}).Where("id = ?", id).Update("started_at", time.Now()).Error
+}
+
+// ClearAllData wipes every task and dead-letter row — the dashboard's "Clear" button
+// uses it to reset to an empty slate. DEV/DEMO utility.
+func (s *TaskService) ClearAllData() error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("1 = 1").Delete(&models.Task{}).Error; err != nil {
+			return err
 		}
-		return tx.Create(&tasks).Error
+		return tx.Where("1 = 1").Delete(&models.DeadLetterTask{}).Error
 	})
 }
 

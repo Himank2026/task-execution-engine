@@ -5,7 +5,7 @@
 > not just wired libraries together. Each entry: **Problem → Solution → "the line you say"**,
 > plus likely follow-up questions for the meaty ones.
 >
-> Status: covers Phases 0–7 (backend + React dashboard). Append new sections as later phases land.
+> Status: covers Phases 0–7 + the distributed worker registry (Phase 10). Append new sections as later phases land.
 
 ---
 
@@ -15,6 +15,68 @@
 > over an API, the tasks live in a MySQL table that *is* the queue, a pool of worker
 > goroutines claims and runs them concurrently with `SELECT ... FOR UPDATE SKIP LOCKED`,
 > failures retry and then dead-letter, and a React dashboard watches it all live over SSE."
+
+---
+
+# Phase 10 — Going distributed (the headline)
+
+## A. Scaling out — "how do you run this on multiple machines?"
+
+**Problem:** One backend = 4 workers. How do you scale to handle more load, and how do the
+instances avoid stepping on each other (running the same task twice)?
+
+**Solution:** A backend instance is just **the same binary with a unique `INSTANCE_ID`**. You run N
+copies (backend-1, backend-2, …) and they **all share one MySQL and one Redis**. No new code to
+scale — they coordinate entirely through that shared state:
+- The **`SELECT ... FOR UPDATE SKIP LOCKED`** dequeue (Phase 3) is what makes this safe: every
+  instance's workers claim *distinct* rows and skip locked ones, so N instances × 4 workers pull from
+  the one queue with **zero double-processing**.
+- Each task is stamped `processed_by = <instance>`, so the distribution is visible.
+- The **rate limiter lives in Redis**, so the per-client limit is enforced *globally* across all
+  instances (an in-memory counter would let a client do N× the limit with N instances).
+
+**The line you say:** *"To scale I just run more copies of the binary pointed at the same MySQL and
+Redis. SKIP LOCKED means they never grab the same task, so it's horizontally scalable with no
+coordination code — the database IS the coordinator. Shared state that must be global, like the rate
+limit, lives in Redis."*
+
+## B. The cross-instance worker panel — "how does the dashboard show every instance's workers?"
+
+**Problem:** Each instance only knows its *own* 4 workers (they're in-memory). The dashboard talks to
+one instance, so it would only ever see that one's 4 — not the full fleet.
+
+**Solution:** A **Redis-backed worker registry with heartbeats**. Each instance, every 2 seconds,
+writes its worker snapshot to a Redis key `workers:<instanceID>` with a **6-second TTL**. The
+`GET /api/workers` endpoint reads **all** `workers:*` keys and merges them. So whichever instance the
+dashboard hits, it returns the whole fleet — grouped by instance. A crashed instance stops
+heartbeating, its key **expires**, and it disappears from the panel automatically (the TTL is the
+liveness check).
+
+**The line you say:** *"Each instance heartbeats its worker state into Redis with a short TTL; the
+workers endpoint aggregates all instances' keys. So the dashboard shows every worker across the fleet
+no matter which instance served it, and dead instances drop off when their key expires."*
+
+**Follow-ups:**
+- *Why Redis, not query each instance?* → "I'd need service discovery and to fan-out to every
+  instance. A shared registry with TTL is simpler and naturally handles liveness — no heartbeat, no key,
+  gone."
+- *Isn't `KEYS workers:*` a problem?* → "At a handful of instances it's fine; at scale I'd use `SCAN`
+  or keep a Redis SET of live instance ids."
+- *In prod, how does the browser reach the instances?* → "An **nginx `upstream` block** round-robins
+  the browser's same-origin requests across the 3 backend containers (it's in my docker-compose setup).
+  The Redis registry means whichever instance nginx routes to can answer the workers query for the
+  whole fleet. And the task *processing* spreads automatically via `SKIP LOCKED` regardless of which
+  instance nginx picks — the load balancing of HTTP and the distribution of work are independent."
+
+## C. Batch submit — "what if a client wants to enqueue 1,000 jobs?"
+
+**Problem:** `POST /api/tasks` creates one task. Submitting a burst one-at-a-time is N round-trips.
+
+**Solution:** `POST /api/tasks/batch` takes an array of task inputs and does a **single bulk INSERT**
+(one DB round-trip for the whole batch), with per-element validation (`dive`) and a size cap.
+
+**The line you say:** *"A batch endpoint does one bulk insert instead of N round-trips — much cheaper
+for bursts — with each element validated and the batch size capped to protect the DB."*
 
 ---
 
@@ -101,6 +163,30 @@ group.
 **The line you say:** *"My own dashboard tripped my rate limiter, which taught me limits should be
 per-endpoint — read-heavy dashboard polling and write abuse-protection are different budgets."*
 
+## F. A metrics-precision bug — "small percentages were showing as 0%"
+
+**Problem:** A failure rate of `2/605 = 0.33%` displayed as **0.0%**, and `603/605` completed showed as
+**100%**. The numbers lied for small values.
+
+**Solution:** I was **rounding the ratio (a 0–1 value) to 2 decimals in the backend** — so `0.0033`
+collapsed to `0.00`. Fix: the API returns the **raw ratio**; the **UI** formats it to 1-decimal
+percent. Lesson: **round at the presentation layer, not the data layer** — rounding early destroys
+precision you can never get back.
+
+**The line you say:** *"I round for display, not in the data. A ratio rounded to 2 decimals turns
+0.33% into 0.00%, so the API returns the raw number and the UI formats it."*
+
+## G. Dashboard UX worth mentioning (drill-downs & scope)
+
+- **Per-task detail drawer:** click any task → its full lifecycle (created → started → completed,
+  queue wait, execution time, which instance processed it, error) — an audit trail per job.
+- **Filters + pagination + ops view:** filter the global task list by client / type / status; the list
+  is a global `?all=true` ops view, but the underlying API stays per-tenant by default (isolation intact).
+- **Scope toggle (all-clients vs one client)** on Analytics + a dedicated **"Task Types" tab**:
+  per-type completed/failed % and average timings, computed **server-side over every row** (not a sample).
+- **Demo data (append) / Clear** dev buttons + **batch submit** (with a random-mix option) — so the
+  thing is easy to demo without piling up junk data.
+
 ---
 
 # Phase 6 — Real-time + analytics
@@ -110,9 +196,10 @@ per-endpoint — read-heavy dashboard polling and write abuse-protection are dif
 **Problem:** Any client could flood the API with requests, starving others and overloading the DB. I
 need a per-client cap — e.g. 10 requests / 60s — with the (N+1)th getting `429 Too Many Requests`.
 
-**Solution:** A **sliding-window** rate limiter, per client, backed by **Redis**, run as Gin
-middleware *after* auth (so I limit by `client_id`, not IP — one tenant's burst can't eat another's
-allowance).
+**Solution:** A **sliding-window** rate limiter, per client, backed by **Redis**. It runs *after* auth
+so I limit by `client_id` (not IP) — one tenant's burst can't eat another's allowance. (Final design
+is **cost-weighted and applied only on the task-submit path** — see A2 below — but here's the core
+sliding-window first.)
 
 Why sliding window over a fixed-window counter: a fixed per-minute counter lets a client send 10 at
 `12:00:59` and 10 more at `12:01:00` — 20 in one real second, because they straddle the bucket edge.
@@ -128,7 +215,7 @@ The catch: those three steps must be **atomic**, or two simultaneous requests co
 scripts execute to completion with nothing interleaved. That's the check-then-act lesson again (same
 as the dequeue and the cancel race): push the decision to where it can be made atomically.
 
-On a Redis error the middleware **fails open** (allows the request) — a limiter outage shouldn't take
+On a Redis error the limiter **fails open** (allows the request) — a limiter outage shouldn't take
 the whole API down. (Planned follow-up: an in-memory fallback limiter instead of fully open.)
 
 **The line you say:** *"Per-client sliding-window limiter in Redis using a sorted set of request
@@ -145,6 +232,42 @@ Redis is down."*
   fixed window) uses O(1) memory and is the move at very high request volumes."
 - *Why fail open, not closed?* → "Availability call: blocking all traffic because the *limiter* is
   down is usually worse than briefly not limiting. For an abuse-sensitive endpoint you might fail closed."
+
+## A2. Weighting it by cost — the upgrade that makes it *mine*
+
+**(This is the part that reads as senior judgment, not a copied tutorial.)**
+
+**The realization:** counting *requests* is **gameable** the moment you add a **batch endpoint** —
+`POST /api/tasks/batch` lets one request enqueue up to 200 tasks. A request-count limit would happily
+let a client bypass the cap by bundling. So I limit by **the resource that actually matters**: the
+number of tasks. The limiter consumes **N tokens for a batch of N** (`AllowN`, all-or-nothing, still
+one atomic Lua script), and it's applied **inside the submit handlers** (`POST /tasks`, `/tasks/batch`)
+— *not* as a blanket middleware — so dashboard reads and admin seeding aren't throttled. Broad
+per-IP/request throttling I'd push to the **nginx edge** (cheaper; stops floods before they hit the app).
+
+**Why this is the strong version (not "couldn't build the basic one"):** the plain per-request limiter
+is exactly the **`n = 1` case** of this — I built the textbook version *and* generalized it. The
+weighted sliding-window still needs all the textbook machinery (sorted set, window pruning, atomic
+Lua); the cost-weighting is extra judgment on top, applied to *my* system's real bottleneck.
+
+**The line you say:** *"The standard limiter counts requests — and mine does exactly that when the
+batch size is one. But a batch endpoint makes request-counting gameable, so I weight the limit by cost
+(task count) to protect the actual resource. Broad per-IP throttling I'd put at the nginx edge, not in
+app code."*
+
+**Topics to study around this (to go deep with confidence):**
+- **Algorithms:** fixed window, **sliding-window log** (what I used), sliding-window counter, **token
+  bucket**, **leaky bucket** — know each one's memory/accuracy/burst trade-offs and when to pick it.
+- **Where limiting lives:** app-level vs **API gateway / load balancer** (nginx `limit_req`, Envoy,
+  Cloudflare) vs client-side backoff — and *why* edge throttling is cheaper.
+- **Distributed correctness:** why a shared store (Redis) is needed across instances; atomicity via
+  **Lua scripts** / `MULTI`/`EXEC`; the race where two requests both read `count = max−1`.
+- **Redis specifics:** sorted sets (`ZADD` / `ZCARD` / `ZREMRANGEBYSCORE`), key **TTL/expiry**, `EVAL`,
+  and `KEYS` vs `SCAN`.
+- **HTTP semantics:** `429 Too Many Requests`, the `Retry-After` and `X-RateLimit-*` headers, idempotency.
+- **Failure modes:** fail-open vs fail-closed, in-memory fallback when Redis is down, clock skew.
+- **Adjacent concepts:** **back-pressure**, **load shedding**, **quotas vs rate limits**, circuit
+  breakers, **bulkheads**, and per-user vs per-IP vs per-route limiting.
 
 ## B. Analytics — "how do you report on the system's behaviour?"
 

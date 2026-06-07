@@ -1,0 +1,4 @@
+# Don't copy local installs/builds into the image — npm ci reinstalls cleanly.
+node_modules
+dist
+.vite

@@ -3,12 +3,20 @@ import axios from 'axios'
 // The list of seeded client API keys, so the UI can switch between tenants.
 export const API_KEYS = ['key-alpha', 'key-beta', 'key-gamma', 'key-delta', 'key-test']
 
+// The client ids (without the "key-" prefix), for filters and labels.
+export const CLIENTS = API_KEYS.map((k) => k.replace(/^key-/, ''))
+
 // Which client are we acting as? Stored in the browser so it survives refreshes.
 export function getApiKey(): string {
   return localStorage.getItem('apiKey') || 'key-alpha'
 }
 export function setApiKey(key: string) {
   localStorage.setItem('apiKey', key)
+}
+
+// The client id behind the current key, e.g. "key-alpha" -> "alpha".
+export function getClientId(): string {
+  return getApiKey().replace(/^key-/, '')
 }
 
 // One axios instance for the whole app. baseURL '/api' is forwarded to the Go backend
@@ -25,6 +33,7 @@ api.interceptors.request.use((config) => {
 // Shape of a task as returned by the API (matches models.Task in Go).
 export interface Task {
   id: number
+  client_id: string
   type: string
   priority: number
   status: string
@@ -34,6 +43,19 @@ export interface Task {
   started_at: string | null
   completed_at: string | null
   error_message: string | null
+  processed_by: string | null
+}
+
+// A consistent badge colour per client, so alpha/beta/gamma are easy to tell apart.
+const CLIENT_COLORS: Record<string, string> = {
+  alpha: 'blue',
+  beta: 'grape',
+  gamma: 'teal',
+  delta: 'orange',
+  test: 'gray',
+}
+export function clientColor(clientID: string): string {
+  return CLIENT_COLORS[clientID] ?? 'indigo'
 }
 
 // GET /api/tasks returns a page of tasks plus pagination metadata.

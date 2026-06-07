@@ -17,15 +17,15 @@ import (
 // (not built here) so main can share ONE instance between the HTTP layer and the
 // worker pool — both must operate on the same business logic. db is still needed
 // for the auth middleware's key lookups.
-func SetupRouter(db *gorm.DB, taskService *services.TaskService, limiter *ratelimit.Limiter, hub *sse.Hub, pool *worker.Pool) *gin.Engine {
+func SetupRouter(db *gorm.DB, taskService *services.TaskService, limiter *ratelimit.Limiter, hub *sse.Hub, registry *worker.Registry) *gin.Engine {
 	r := gin.Default()
 
 	// Build the controllers on top of the services. The task service is shared (passed
 	// in); the analytics service is read-only, so we build it here from db.
-	taskController := controllers.NewTaskController(taskService)
+	taskController := controllers.NewTaskController(taskService, limiter)
 	analyticsController := controllers.NewAnalyticsController(services.NewAnalyticsService(db))
 	sseController := controllers.NewSSEController(hub)
-	workerController := controllers.NewWorkerController(pool)
+	workerController := controllers.NewWorkerController(registry)
 
 	api := r.Group("/api")
 
@@ -33,26 +33,29 @@ func SetupRouter(db *gorm.DB, taskService *services.TaskService, limiter *rateli
 	api.GET("/health", controllers.HealthCheck)
 
 	// Protected: everything here runs APIKeyAuth FIRST (so a valid client_id is in the
-	// context), THEN the per-client rate limiter (which reads that client_id). Order
-	// matters: auth must populate the client before the limiter counts against it.
+	// context). The rate limiter is NOT a blanket middleware — it's applied inside the
+	// task-submit handlers (weighted by task count), so dashboard GET polling and demo
+	// seeding aren't throttled.
 	authed := api.Group("")
 	authed.Use(middleware.APIKeyAuth(db))
-	authed.Use(middleware.RateLimit(limiter))
 	{
 		authed.POST("/tasks", taskController.Create)
+		authed.POST("/tasks/batch", taskController.CreateBatch)
 		authed.GET("/tasks", taskController.List)
 		authed.GET("/tasks/:id", taskController.GetByID)
 		authed.POST("/tasks/:id/cancel", taskController.Cancel)
 
 		authed.GET("/analytics", analyticsController.Summary)
 		authed.GET("/analytics/throughput", analyticsController.Throughput)
+		authed.GET("/analytics/types", analyticsController.Types)
 
 		authed.GET("/workers", workerController.List)
 
 		authed.GET("/sse/events", sseController.Stream)
 
-		// DEV/DEMO utility: wipe + reseed this client's tasks.
-		authed.POST("/demo/reset", taskController.ResetDemo)
+		// DEV/DEMO utilities: append a batch of random tasks across clients, or wipe all.
+		authed.POST("/demo/seed", taskController.SeedDemo)
+		authed.POST("/demo/clear", taskController.ClearDemo)
 	}
 
 	return r

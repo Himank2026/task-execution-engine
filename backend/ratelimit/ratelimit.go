@@ -47,6 +47,29 @@ end
 return -1                                -- over the limit: deny
 `)
 
+// allowNScript is the weighted version: it tries to consume N tokens at once (a batch
+// of N tasks). All-or-nothing — if the N wouldn't fit under the limit, none are added.
+// ARGV[5] is a unique base; we append :1..:n so every member is distinct.
+var allowNScript = redis.NewScript(`
+local key    = KEYS[1]
+local now    = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local max    = tonumber(ARGV[3])
+local n      = tonumber(ARGV[4])
+local base   = ARGV[5]
+
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+local count = redis.call('ZCARD', key)
+if count + n <= max then
+    for i = 1, n do
+        redis.call('ZADD', key, now, base .. ':' .. i)
+    end
+    redis.call('PEXPIRE', key, window)
+    return max - count - n          -- remaining after admitting the batch
+end
+return -1                           -- batch rejected
+`)
+
 // Limiter holds the Redis client and the policy (max requests per window).
 type Limiter struct {
 	rdb    *redis.Client
@@ -86,5 +109,29 @@ func (l *Limiter) Allow(ctx context.Context, id string) (allowed bool, remaining
 	return true, res, nil
 }
 
-// Max returns the configured request ceiling (for response headers).
+// AllowN tries to consume n tokens at once (a batch of n tasks). All-or-nothing: if the
+// n wouldn't fit under the limit, none are consumed and it's denied. remaining is how
+// many more tokens are left in the window.
+func (l *Limiter) AllowN(ctx context.Context, id string, n int) (allowed bool, remaining int, err error) {
+	if n < 1 {
+		n = 1
+	}
+	now := time.Now().UnixMilli()
+	base := fmt.Sprintf("%d-%d", now, rand.Int63())
+	key := "ratelimit:" + id
+
+	res, err := allowNScript.Run(ctx, l.rdb,
+		[]string{key},
+		now, l.window.Milliseconds(), l.max, n, base,
+	).Int()
+	if err != nil {
+		return false, 0, err
+	}
+	if res < 0 {
+		return false, 0, nil // the batch was rejected
+	}
+	return true, res, nil
+}
+
+// Max returns the configured ceiling (for response headers / messages).
 func (l *Limiter) Max() int { return l.max }

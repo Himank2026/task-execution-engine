@@ -21,8 +21,9 @@ func NewAnalyticsController(analytics *services.AnalyticsService) *AnalyticsCont
 // client_id comes from the auth middleware, so the numbers are scoped to the caller.
 func (ac *AnalyticsController) Summary(c *gin.Context) {
 	clientID := c.GetString("client_id")
+	allClients := c.Query("all") == "true"
 
-	summary, err := ac.analytics.GetSummary(clientID)
+	summary, err := ac.analytics.GetSummary(clientID, allClients)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -35,12 +36,27 @@ func (ac *AnalyticsController) Summary(c *gin.Context) {
 // the last few minutes, for the throughput chart.
 func (ac *AnalyticsController) Throughput(c *gin.Context) {
 	clientID := c.GetString("client_id")
+	allClients := c.Query("all") == "true"
 
-	points, err := ac.analytics.GetThroughput(clientID)
+	points, err := ac.analytics.GetThroughput(clientID, allClients)
 	if err != nil {
 		respondError(c, err)
 		return
 	}
 
 	c.JSON(http.StatusOK, points)
+}
+
+// Types handles GET /api/analytics/types — per-task-type breakdown (status %, timings).
+func (ac *AnalyticsController) Types(c *gin.Context) {
+	clientID := c.GetString("client_id")
+	allClients := c.Query("all") == "true"
+
+	stats, err := ac.analytics.GetTypeBreakdown(clientID, allClients)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, stats)
 }

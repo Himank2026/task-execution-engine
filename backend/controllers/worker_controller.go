@@ -8,20 +8,24 @@ import (
 	"github.com/Himank2026/task-execution-engine/backend/worker"
 )
 
-// WorkerController exposes the live state of the worker pool (an ops-style view: it
-// reflects GLOBAL worker activity on this instance, across all clients).
+// WorkerController exposes the live state of the worker pool across ALL backend
+// instances (an ops view). It reads the shared registry in Redis, so it returns every
+// instance's workers no matter which instance handled the request.
 type WorkerController struct {
-	pool *worker.Pool
+	registry *worker.Registry
 }
 
-func NewWorkerController(pool *worker.Pool) *WorkerController {
-	return &WorkerController{pool: pool}
+func NewWorkerController(registry *worker.Registry) *WorkerController {
+	return &WorkerController{registry: registry}
 }
 
-// List handles GET /api/workers — which task each worker is running, or idle.
+// List handles GET /api/workers — every instance and what each of its workers is doing.
 func (wc *WorkerController) List(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"instance": wc.pool.InstanceID(),
-		"workers":  wc.pool.WorkerStates(),
-	})
+	instances, err := wc.registry.AllInstances(c.Request.Context())
+	if err != nil {
+		// Don't fail the dashboard on a Redis hiccup; return an empty set.
+		c.JSON(http.StatusOK, gin.H{"instances": []worker.InstanceWorkers{}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"instances": instances})
 }

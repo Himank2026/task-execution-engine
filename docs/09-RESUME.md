@@ -23,12 +23,13 @@ Result: one heavy **backend-systems** project (Go) + one **full-stack web app** 
 > **Task Execution Engine — Distributed Background Job Processing System**
 > *Go, Gin, MySQL, Redis, React.js, Docker, SSE* — Live Demo | GitHub
 >
-> - Built a **concurrent worker pool** in Go (**goroutines, channels**) processing **[X] tasks/sec** with automatic **crash recovery** and hung-worker detection, achieving **zero task loss** across forced worker failures.
+> - Built a **concurrent worker pool** in Go (**goroutines, channels**) processing **~4.6 tasks/sec across 12 workers / 3 instances** (scaling **~2.5×** from one) with automatic **crash recovery** and hung-worker detection, achieving **zero task loss** across forced worker failures.
 > - Designed a **database-backed job queue** using MySQL `SELECT ... FOR UPDATE SKIP LOCKED` for concurrency-safe dequeue, **preventing duplicate processing** across parallel workers.
-> - Implemented **fair scheduling (Deficit Round Robin)** to eliminate client starvation under **skewed load**, ensuring balanced task distribution across **[N] clients**.
-> - Added **Redis-backed rate limiting** (sliding window, 10 req/min/client) and **real-time tracking via Server-Sent Events**, with a **React** dashboard rendering live execution analytics.
+> - Implemented **fair scheduling (Deficit Round Robin)** to eliminate client starvation under **skewed load**, ensuring balanced task distribution across **5 multi-tenant clients**.
+> - Added **Redis-backed rate limiting** (sliding window, **cost-weighted by batch size**, atomic Lua script) and **real-time tracking via Server-Sent Events**, with a **React** dashboard rendering live execution analytics.
+> - Containerized the full stack (**Docker Compose**) and ran **3 backend instances behind an nginx load balancer** sharing one MySQL/Redis — horizontally scalable with **zero coordination code** (the DB is the coordinator).
 
-`[X]` and `[N]` get filled with measured numbers (see below).
+`[X]` and `[N]` get filled with measured numbers (see below / `BENCHMARKS.md`).
 
 ---
 
@@ -48,16 +49,19 @@ Together they say: *applied it at work → went deeper on my own.*
 
 ## What we'll quantify (and how)
 
-We measure with a load-test script (`bench/`) and the DB GUI. **Real numbers only** — a defensible "~800 tasks/sec on an 8-worker pool" beats a made-up "10,000 tasks/sec" every time.
+We measure with a load-test script (`bench/`) and the DB GUI. **Real numbers only** — a defensible
+"~7 tasks/sec on 12 workers" beats a made-up "10,000 tasks/sec" every time. **Full methodology + every
+quantifiable stat is in [BENCHMARKS.md](BENCHMARKS.md)** — run the bench, record your numbers there, then
+mirror the catchiest into the resume bullets above.
 
 ### Print these (the catchiest ~5)
 | Metric | Example phrasing | How measured |
 |--------|------------------|--------------|
-| Throughput | "~[X] tasks/sec" | Load test: submit N tasks, measure completion rate |
-| Scaling factor | "[N]x throughput scaling 1→8 workers" | Run the bench at 1/2/4/8 workers |
-| Zero loss + recovery | "0 task loss; recovery <[X]s across forced crashes" | Kill workers mid-run, measure |
-| Fairness | "balanced across [N] clients under 100:1 skewed load" | Submit lopsided load, compare distribution |
-| Rate limit + SSE | "10 req/min/client; live updates via SSE" | Burst test + dashboard |
+| Throughput | "~4.6 tasks/sec on 12 workers" | Load test: 200 tasks, completion rate (`bench/`) |
+| Scaling factor | "~2.5x throughput scaling 1→3 instances" | bench at 1 (1.81/s) vs 3 (4.59/s) instances |
+| Zero loss + recovery | "0 task loss; recovery <60s across forced crashes" | `kill -9` an instance mid-run |
+| Fairness | "no starvation across [N] clients under skewed load" | Submit lopsided load, watch distribution |
+| Rate limit + SSE | "cost-weighted limit (50 tasks/min/client); live updates via SSE" | Burst test + dashboard |
 
 ### Keep as interview backup
 - API latency (p50/p95/p99) under load

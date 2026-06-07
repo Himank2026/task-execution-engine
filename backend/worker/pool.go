@@ -188,6 +188,12 @@ func (p *Pool) process(workerID int, task *models.Task) {
 	p.setBusy(workerID, task)
 	defer p.setIdle(workerID) // mark idle again no matter how this returns
 
+	// Stamp started_at now — when the handler actually begins — so execution time
+	// reflects pure handler runtime, not the time spent waiting for a free worker.
+	if err := p.tasks.MarkStarted(task.ID); err != nil {
+		slog.Error("mark started failed", "task_id", task.ID, "err", err)
+	}
+
 	slog.Info("task started",
 		"worker", workerID, "task_id", task.ID, "client", task.ClientID,
 		"type", task.Type, "priority", task.Priority)
