@@ -39,6 +39,14 @@ type Config struct {
 	// treats it as hung/crashed and requeues it. Must be comfortably larger than the
 	// longest real task so a merely-slow task isn't wrongly reclaimed. Default 60s.
 	WatchdogTimeout time.Duration
+
+	// RateLimitMax is how many API requests one client may make per RateLimitWindow
+	// before getting 429s. Default 10.
+	RateLimitMax int
+
+	// RateLimitWindow is the sliding window over which RateLimitMax is counted.
+	// Default 60s.
+	RateLimitWindow time.Duration
 }
 
 // Load reads configuration from the environment, applying defaults for any
@@ -65,6 +73,9 @@ func Load() *Config {
 
 		WatchdogInterval: getEnvSeconds("WATCHDOG_INTERVAL_SECONDS", 15),
 		WatchdogTimeout:  getEnvSeconds("WATCHDOG_TIMEOUT_SECONDS", 60),
+
+		RateLimitMax:    getEnvInt("RATE_LIMIT_MAX", 10),
+		RateLimitWindow: getEnvSeconds("RATE_LIMIT_WINDOW_SECONDS", 60),
 	}
 }
 

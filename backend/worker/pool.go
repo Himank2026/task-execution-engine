@@ -27,6 +27,7 @@ type Pool struct {
 	tasks      *services.TaskService // used to record results (complete/fail)
 	instanceID string                // for logging which instance ran it
 	numWorkers int
+	pub        Publisher // notified on each task state change (may be nil)
 
 	queue  chan *models.Task  // scheduler → workers
 	wg     sync.WaitGroup     // tracks workers so Stop() can wait for them
@@ -34,8 +35,16 @@ type Pool struct {
 	cancel context.CancelFunc // flips ctx to Done() on shutdown
 }
 
-// NewPool builds the pool but does NOT start it — call Start().
-func NewPool(tasks *services.TaskService, instanceID string, numWorkers int) *Pool {
+// Publisher is the slice of the SSE hub the pool needs: announce that a task changed
+// state. The pool depends on this tiny interface (not the concrete hub) so it stays
+// decoupled from the sse package — same pattern as the scheduler's Dispatcher.
+type Publisher interface {
+	PublishTaskEvent(eventType string, taskID uint64, clientID, status string)
+}
+
+// NewPool builds the pool but does NOT start it — call Start(). pub may be nil (then
+// no events are published).
+func NewPool(tasks *services.TaskService, instanceID string, numWorkers int, pub Publisher) *Pool {
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
@@ -43,9 +52,17 @@ func NewPool(tasks *services.TaskService, instanceID string, numWorkers int) *Po
 		tasks:      tasks,
 		instanceID: instanceID,
 		numWorkers: numWorkers,
+		pub:        pub,
 		// Buffered to numWorkers so the scheduler can stage a little work ahead
 		// without blocking on every single Submit.
 		queue: make(chan *models.Task, numWorkers),
+	}
+}
+
+// publish sends a task event if a publisher is wired (nil-safe).
+func (p *Pool) publish(eventType string, task *models.Task, status string) {
+	if p.pub != nil {
+		p.pub.PublishTaskEvent(eventType, task.ID, task.ClientID, status)
 	}
 }
 
@@ -107,6 +124,7 @@ func (p *Pool) process(workerID int, task *models.Task) {
 	slog.Info("task started",
 		"worker", workerID, "task_id", task.ID, "client", task.ClientID,
 		"type", task.Type, "priority", task.Priority)
+	p.publish("task.started", task, "running")
 
 	handler := handlerFor(task.Type)
 	err := runHandler(p.ctx, handler, task)
@@ -119,6 +137,7 @@ func (p *Pool) process(workerID int, task *models.Task) {
 		slog.Warn("task failed",
 			"worker", workerID, "task_id", task.ID,
 			"retry_count", task.RetryCount, "max_retries", task.MaxRetries, "err", err)
+		p.publish("task.failed", task, "failed")
 		return
 	}
 
@@ -127,6 +146,7 @@ func (p *Pool) process(workerID int, task *models.Task) {
 		return
 	}
 	slog.Info("task completed", "worker", workerID, "task_id", task.ID, "client", task.ClientID)
+	p.publish("task.completed", task, "completed")
 }
 
 // runHandler runs a task's handler behind a panic safety net. Without this, a panic

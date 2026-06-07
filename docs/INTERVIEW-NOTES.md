@@ -5,7 +5,7 @@
 > not just wired libraries together. Each entry: **Problem → Solution → "the line you say"**,
 > plus likely follow-up questions for the meaty ones.
 >
-> Status: covers Phases 0–4, plus Phase 5 graceful shutdown. Append new sections as later phases land.
+> Status: covers Phases 0–6 (backend complete). Append new sections as later phases land.
 
 ---
 
@@ -15,6 +15,122 @@
 > over an API, the tasks live in a MySQL table that *is* the queue, a pool of worker
 > goroutines claims and runs them concurrently with `SELECT ... FOR UPDATE SKIP LOCKED`,
 > failures retry and then dead-letter, and a React dashboard watches it all live over SSE."
+
+---
+
+# Phase 6 — Real-time + analytics
+
+## A. Rate limiting — "how do you stop one client from hammering the API?"
+
+**Problem:** Any client could flood the API with requests, starving others and overloading the DB. I
+need a per-client cap — e.g. 10 requests / 60s — with the (N+1)th getting `429 Too Many Requests`.
+
+**Solution:** A **sliding-window** rate limiter, per client, backed by **Redis**, run as Gin
+middleware *after* auth (so I limit by `client_id`, not IP — one tenant's burst can't eat another's
+allowance).
+
+Why sliding window over a fixed-window counter: a fixed per-minute counter lets a client send 10 at
+`12:00:59` and 10 more at `12:01:00` — 20 in one real second, because they straddle the bucket edge.
+A sliding window always looks at "the last 60 seconds from *now*", so there's no boundary to exploit.
+
+Implementation — a **sorted set per client** (`ratelimit:<client_id>`), request timestamps as scores:
+1. `ZREMRANGEBYSCORE` — drop entries older than `now - window` (slide the window),
+2. `ZCARD` — count what's left,
+3. if under the limit: `ZADD` this request + `PEXPIRE` the key; else deny.
+
+The catch: those three steps must be **atomic**, or two simultaneous requests could both read
+"count = max-1" and both get admitted. So I run them as a single **Lua script** inside Redis — Lua
+scripts execute to completion with nothing interleaved. That's the check-then-act lesson again (same
+as the dequeue and the cancel race): push the decision to where it can be made atomically.
+
+On a Redis error the middleware **fails open** (allows the request) — a limiter outage shouldn't take
+the whole API down. (Planned follow-up: an in-memory fallback limiter instead of fully open.)
+
+**The line you say:** *"Per-client sliding-window limiter in Redis using a sorted set of request
+timestamps, and the prune-count-admit logic runs as one atomic Lua script so concurrent requests
+can't both slip past the limit. It's keyed by client_id so it's fair per tenant, and it fails open if
+Redis is down."*
+
+**Follow-ups:**
+- *Why Redis, not in-memory?* → "So the limit is shared across all backend instances — with 3
+  instances behind a load balancer, an in-memory counter would let a client do 3x the limit. Redis is
+  the shared source of truth. I'd add an in-memory fallback only for when Redis is unreachable."
+- *Sliding window log vs sliding window counter?* → "I used the log (one entry per request) — exact,
+  at the cost of memory proportional to the limit. The counter variant (weighting current + previous
+  fixed window) uses O(1) memory and is the move at very high request volumes."
+- *Why fail open, not closed?* → "Availability call: blocking all traffic because the *limiter* is
+  down is usually worse than briefly not limiting. For an abuse-sensitive endpoint you might fail closed."
+
+## B. Analytics — "how do you report on the system's behaviour?"
+
+**Problem:** The dashboard needs metrics: how many tasks in each state, how often they fail, how long
+they take to run, how long they wait in the queue, and recent throughput — all per client.
+
+**Solution:** A read-only `AnalyticsService` (separate from `TaskService` — different job: it only
+aggregates, never mutates) behind `GET /api/analytics`, client-scoped like everything else. It's
+straight SQL aggregation:
+- **status breakdown + total:** one `GROUP BY status` pass.
+- **failure rate:** `failed / (completed + failed)` — only *finished* work counts toward success/fail.
+- **avg execution time:** `AVG(completed_at − started_at)` over completed tasks.
+- **avg queue wait:** `AVG(started_at − created_at)` — the time before a worker picked it up.
+- **throughput:** count completed in the last hour.
+
+Two details worth mentioning: I used MySQL's `TIMESTAMPDIFF(MICROSECOND, a, b)/1000` for millisecond
+durations, and wrapped the average in a `sql.NullFloat64` because `AVG` over zero rows returns `NULL`,
+not 0 — so a brand-new client doesn't blow up the query.
+
+**The line you say:** *"A separate read-only analytics service does GROUP BY / AVG aggregation per
+client — status counts, failure rate, execution time, queue wait, throughput. I split reporting from
+the task service because reads and mutations are different responsibilities, and the queue table is
+already the source of truth, so no separate analytics store is needed at this scale."*
+
+**Follow-ups:**
+- *Won't these aggregates get slow as the table grows?* → "Yes — `GROUP BY status` and time-range
+  scans get expensive at millions of rows. Next steps: indexes on `(client_id, status)` and
+  `completed_at`, then pre-aggregated rollups (a periodic job writing per-minute summaries) so the
+  dashboard reads small tables instead of scanning the whole queue."
+- *Why not compute these in Go?* → "The DB aggregates far more efficiently than pulling every row into
+  the app and looping. Push computation to the data."
+
+## C. Real-time updates with SSE — "how does the dashboard update live?"
+
+**Problem:** The dashboard should reflect task state the instant it changes, without the browser
+polling the API every second (wasteful, laggy).
+
+**Solution:** **Server-Sent Events (SSE)** — the browser opens one long-lived HTTP connection
+(`GET /api/sse/events`) and the server *pushes* events down it. I chose SSE over WebSockets because
+the data flow is one-directional (server → browser) and SSE is just HTTP — no separate protocol,
+auto-reconnect built into the browser's `EventSource`.
+
+Architecture:
+- A **Hub** keeps a registry of connected dashboards (each a buffered channel). The worker pool, on
+  every task `started`/`completed`/`failed`, calls `PublishTaskEvent`; the hub fans it out.
+- **Per-client filtering:** the hub only delivers an event to subscribers whose `client_id` matches
+  the task's owner — same multi-tenant isolation as the rest of the API. Alpha never sees beta's events.
+- **Decoupling:** the pool depends on a tiny `Publisher` interface (`PublishTaskEvent(...)`), so it
+  doesn't import the sse package at all — same trick as the scheduler's `Dispatcher`.
+- **Non-blocking publish:** sends to a subscriber use `select { case ch <- e: default: }` — if a slow
+  dashboard's buffer is full, we *drop* the update rather than block the worker goroutine. A missed UI
+  refresh is acceptable; a stalled worker is not.
+- **Heartbeat:** the handler sends a heartbeat event every 15s so the connection survives proxies and
+  we detect dead clients; disconnect is caught via the request's context being cancelled.
+
+**The line you say:** *"Live updates over SSE: a hub holds open connections and the worker pool
+publishes lifecycle events to it, fanned out per client_id for tenant isolation. Publishing is
+non-blocking so a slow browser can't stall a worker, and the pool only knows a small Publisher
+interface, not the SSE package. SSE over WebSockets because the flow is one-way and it's plain HTTP."*
+
+**Follow-ups:**
+- *SSE vs WebSocket vs polling?* → "Polling wastes requests and adds latency. WebSockets are
+  bidirectional and heavier. My traffic is server→client only, so SSE — one HTTP connection, browser
+  auto-reconnect, simplest thing that works."
+- *What happens to events while a client is disconnected?* → "They're dropped — SSE is fire-and-forget
+  here. The dashboard fetches a fresh snapshot (the list/analytics endpoints) on (re)connect, then
+  SSE keeps it live. For guaranteed delivery you'd need an event log / Last-Event-ID replay."
+- *Does this work with multiple backend instances?* → "Each instance only has the connections and
+  events for the tasks *it* runs. Behind a load balancer a browser connects to one instance and sees
+  that instance's events. Full cross-instance fan-out would need a Redis Pub/Sub backplane — a clear
+  next step."
 
 ---
 
@@ -146,6 +262,49 @@ retry/dead-letter path — the worker and the process stay up. I verified it wit
   straight to the DLQ."
 - *Where exactly is the recover?* → "Around the handler call only — not around my own
   complete/fail bookkeeping. I want to catch *user task code* panics, not mask bugs in the engine."
+
+## E. The watchdog + the three-legged recovery story — "how do you guarantee no task is lost?"
+
+**(The capstone fault-tolerance answer — ties the whole phase together.)**
+
+**Problem:** A task in `running` means a worker claimed it. But the worker/instance can die or hang
+*after* claiming and *before* finishing, leaving the task frozen in `running` forever — an **orphan**.
+There are three distinct ways this happens, and one mechanism can't cover all three.
+
+**Solution — three complementary mechanisms, each covering what the others miss:**
+
+| Failure | Mechanism | Notes |
+|---|---|---|
+| This instance **crashed**, now rebooting | **Startup recovery** (`RequeueOrphanedTasks`) | Runs once at boot. Scoped to *this* instance's id. **No** retry bump (the instance died, not the task). |
+| Clean **shutdown** (deploy/restart) | **Graceful drain** | Finish in-flight work before exiting (section A). |
+| A **live** instance with a **hung** task, or a **dead peer** that never came back | **Watchdog** | Timer loop: find tasks `running` past a timeout, requeue them. **Not** instance-scoped, so it rescues dead peers too. |
+
+The **watchdog** is the new piece: every `interval` (15s) it runs `SELECT ... WHERE status='running'
+AND started_at < now - timeout` (60s) and routes each stuck task through `FailTask`.
+
+**Two design decisions I can defend:**
+1. **Timeout = failure (bump retries).** Unlike startup recovery, the watchdog *does* count it as an
+   attempt. Why: a task that hangs *every* time would otherwise be requeued forever (a livelock).
+   Treating the timeout as a failure means bounded retries → it eventually dead-letters. The timeout
+   is set well above the longest real task so a merely-slow task is never wrongly reclaimed.
+2. **Not instance-scoped.** Startup recovery only fixes *your own* boot; if a peer instance dies and
+   never restarts, only *another* instance's watchdog can rescue its tasks. So the watchdog
+   deliberately looks at *all* stale `running` tasks, not just its own.
+
+**The line you say:** *"No single mechanism is enough, so I have three: startup recovery for my own
+crash, graceful drain for clean shutdowns, and a watchdog timer for hung workers and dead peers.
+Together they guarantee at-least-once — every accepted task eventually completes or dead-letters."*
+
+**Follow-ups:**
+- *Doesn't the watchdog risk running a task twice?* → "Yes — if a 'stuck' task is actually a slow-but-
+  alive worker, requeuing it could double-run it. That's the at-least-once trade-off: I'd rather run
+  twice than lose work, so handlers should be idempotent. The big timeout makes a false positive rare."
+- *Why a polling timer instead of heartbeats?* → "Heartbeats (workers update a `last_heartbeat`
+  column) detect death faster and more precisely, and that's the natural next step. Timeout-polling is
+  simpler and good enough when task durations are bounded and known."
+- *How did you prove it?* → "I `UPDATE`d a task to `running` with `started_at` 5 minutes ago and
+  `processed_by='dead-instance-99'`. Within one interval the watchdog logged `recovered stuck task`,
+  requeued it, and another worker completed it — cross-instance crash recovery, demonstrated."
 
 ---
 
@@ -390,9 +549,8 @@ about Gin or HTTP, so the worker pool calls the exact same service methods the A
 
 # To add in later phases
 
-- **Phase 5 — Fault tolerance:** hung-worker watchdog (heartbeat/timeout), graceful shutdown on
-  SIGTERM (drain in-flight work). (Startup recovery of orphaned `running` tasks landed early in
-  Phase 4.)
+- **Phase 6 — Real-time + analytics:** SSE live updates, analytics queries, Redis sliding-window
+  rate limiter.
 - **Phase 6+ — Rate limiting (Redis sliding window), SSE live updates, analytics queries, Docker
   Compose + nginx load balancing (the "distributed" proof: multiple backend instances sharing the
   queue via `processed_by`).**

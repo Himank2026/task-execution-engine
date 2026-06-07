@@ -14,8 +14,10 @@ import (
 	"github.com/Himank2026/task-execution-engine/backend/database"
 	"github.com/Himank2026/task-execution-engine/backend/logger"
 	"github.com/Himank2026/task-execution-engine/backend/routes"
+	"github.com/Himank2026/task-execution-engine/backend/ratelimit"
 	"github.com/Himank2026/task-execution-engine/backend/scheduler"
 	"github.com/Himank2026/task-execution-engine/backend/services"
+	"github.com/Himank2026/task-execution-engine/backend/sse"
 	"github.com/Himank2026/task-execution-engine/backend/watchdog"
 	"github.com/Himank2026/task-execution-engine/backend/worker"
 )
@@ -75,8 +77,12 @@ func main() {
 		slog.Info("requeued orphaned tasks", "count", n)
 	}
 
+	// SSE hub: the worker pool publishes task events to it; the HTTP layer streams
+	// them to connected dashboards.
+	hub := sse.NewHub()
+
 	// Start the worker pool (execution): N goroutines running whatever they're given.
-	pool := worker.NewPool(taskService, cfg.InstanceID, cfg.WorkerCount)
+	pool := worker.NewPool(taskService, cfg.InstanceID, cfg.WorkerCount, hub)
 	pool.Start()
 	defer pool.Stop() // runs second (LIFO): drain workers after scheduler stops
 
@@ -91,7 +97,10 @@ func main() {
 	wd.Start()
 	defer wd.Stop() // runs first (LIFO): stop reclaiming before we drain on shutdown
 
-	r := routes.SetupRouter(db, taskService)
+	// Per-client API rate limiter (sliding window, backed by Redis).
+	limiter := ratelimit.NewLimiter(rdb, cfg.RateLimitMax, cfg.RateLimitWindow)
+
+	r := routes.SetupRouter(db, taskService, limiter, hub)
 
 	// Wrap the Gin router in a standard-library http.Server. r.Run() blocks forever and
 	// gives us no way to stop it; an http.Server hands us Shutdown() for a clean,
