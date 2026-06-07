@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Vite dependency pre-bundling cache (auto-generated)
+.vite
