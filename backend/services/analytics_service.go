@@ -3,6 +3,7 @@ package services
 import (
 	"database/sql"
 	"math"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -102,3 +103,71 @@ func (s *AnalyticsService) avgMs(clientID, cond, startCol, endCol string) float6
 
 // round2 rounds to 2 decimal places so the JSON is tidy (e.g. 1234.57 not 1234.5678).
 func round2(f float64) float64 { return math.Round(f*100) / 100 }
+
+// Throughput time-series settings: 30 buckets of 10 seconds = the last 5 minutes.
+const (
+	bucketSeconds = 10
+	bucketCount   = 30
+)
+
+// ThroughputPoint is one time-bucket on the throughput chart.
+type ThroughputPoint struct {
+	Time           string  `json:"time"`             // "HH:mm:ss" label for the x-axis
+	Completed      int64   `json:"completed"`        // tasks completed in this bucket
+	AvgExecutionMs float64 `json:"avg_execution_ms"` // avg run time of those tasks
+	AvgQueueWaitMs float64 `json:"avg_queue_wait_ms"`
+}
+
+// GetThroughput returns completions-over-time for the last 5 minutes, bucketed into
+// 10-second slots. We bucket by 10s (not by minute) so even a short burst of tasks
+// produces a meaningful curve.
+//
+// The buckets are keyed by UNIX epoch seconds, which are timezone-independent — that
+// sidesteps any Go/MySQL timezone mismatch when we zero-fill the empty buckets below.
+func (s *AnalyticsService) GetThroughput(clientID string) ([]ThroughputPoint, error) {
+	type bucketRow struct {
+		BucketUnix int64
+		Completed  int64
+		Exec       sql.NullFloat64
+		Wait       sql.NullFloat64
+	}
+	var rows []bucketRow
+	err := s.db.Raw(`
+		SELECT CAST(FLOOR(UNIX_TIMESTAMP(completed_at) / 10) * 10 AS SIGNED) AS bucket_unix,
+		       COUNT(*) AS completed,
+		       AVG(TIMESTAMPDIFF(MICROSECOND, started_at, completed_at)) / 1000 AS exec,
+		       AVG(TIMESTAMPDIFF(MICROSECOND, created_at, started_at)) / 1000 AS wait
+		FROM tasks
+		WHERE client_id = ? AND status = 'completed'
+		  AND completed_at >= NOW() - INTERVAL 300 SECOND
+		GROUP BY bucket_unix
+	`, clientID).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	byBucket := make(map[int64]bucketRow, len(rows))
+	for _, r := range rows {
+		byBucket[r.BucketUnix] = r
+	}
+
+	// Build all 30 buckets ending at "now", filling gaps with zeros so the chart shows
+	// a continuous timeline instead of just the moments something happened.
+	nowBucket := (time.Now().Unix() / bucketSeconds) * bucketSeconds
+	points := make([]ThroughputPoint, 0, bucketCount)
+	for i := bucketCount - 1; i >= 0; i-- {
+		b := nowBucket - int64(i)*bucketSeconds
+		p := ThroughputPoint{Time: time.Unix(b, 0).Format("15:04:05")}
+		if r, ok := byBucket[b]; ok {
+			p.Completed = r.Completed
+			if r.Exec.Valid {
+				p.AvgExecutionMs = round2(r.Exec.Float64)
+			}
+			if r.Wait.Valid {
+				p.AvgQueueWaitMs = round2(r.Wait.Float64)
+			}
+		}
+		points = append(points, p)
+	}
+	return points, nil
+}

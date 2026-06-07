@@ -9,6 +9,7 @@ import (
 	"github.com/Himank2026/task-execution-engine/backend/ratelimit"
 	"github.com/Himank2026/task-execution-engine/backend/services"
 	"github.com/Himank2026/task-execution-engine/backend/sse"
+	"github.com/Himank2026/task-execution-engine/backend/worker"
 )
 
 // SetupRouter builds the Gin engine and wires the dependency graph:
@@ -16,7 +17,7 @@ import (
 // (not built here) so main can share ONE instance between the HTTP layer and the
 // worker pool — both must operate on the same business logic. db is still needed
 // for the auth middleware's key lookups.
-func SetupRouter(db *gorm.DB, taskService *services.TaskService, limiter *ratelimit.Limiter, hub *sse.Hub) *gin.Engine {
+func SetupRouter(db *gorm.DB, taskService *services.TaskService, limiter *ratelimit.Limiter, hub *sse.Hub, pool *worker.Pool) *gin.Engine {
 	r := gin.Default()
 
 	// Build the controllers on top of the services. The task service is shared (passed
@@ -24,6 +25,7 @@ func SetupRouter(db *gorm.DB, taskService *services.TaskService, limiter *rateli
 	taskController := controllers.NewTaskController(taskService)
 	analyticsController := controllers.NewAnalyticsController(services.NewAnalyticsService(db))
 	sseController := controllers.NewSSEController(hub)
+	workerController := controllers.NewWorkerController(pool)
 
 	api := r.Group("/api")
 
@@ -43,8 +45,14 @@ func SetupRouter(db *gorm.DB, taskService *services.TaskService, limiter *rateli
 		authed.POST("/tasks/:id/cancel", taskController.Cancel)
 
 		authed.GET("/analytics", analyticsController.Summary)
+		authed.GET("/analytics/throughput", analyticsController.Throughput)
+
+		authed.GET("/workers", workerController.List)
 
 		authed.GET("/sse/events", sseController.Stream)
+
+		// DEV/DEMO utility: wipe + reseed this client's tasks.
+		authed.POST("/demo/reset", taskController.ResetDemo)
 	}
 
 	return r

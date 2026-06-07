@@ -100,7 +100,7 @@ func main() {
 	// Per-client API rate limiter (sliding window, backed by Redis).
 	limiter := ratelimit.NewLimiter(rdb, cfg.RateLimitMax, cfg.RateLimitWindow)
 
-	r := routes.SetupRouter(db, taskService, limiter, hub)
+	r := routes.SetupRouter(db, taskService, limiter, hub, pool)
 
 	// Wrap the Gin router in a standard-library http.Server. r.Run() blocks forever and
 	// gives us no way to stop it; an http.Server hands us Shutdown() for a clean,

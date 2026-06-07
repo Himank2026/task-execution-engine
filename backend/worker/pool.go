@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"time"
 
 	"github.com/Himank2026/task-execution-engine/backend/models"
 	"github.com/Himank2026/task-execution-engine/backend/services"
@@ -33,6 +34,30 @@ type Pool struct {
 	wg     sync.WaitGroup     // tracks workers so Stop() can wait for them
 	ctx    context.Context    // cancelled by cancel(); handlers + Submit watch it
 	cancel context.CancelFunc // flips ctx to Done() on shutdown
+
+	// states is the live status of each worker (index = workerID-1), so the dashboard
+	// can show what each worker is running right now. Guarded by statesMu.
+	statesMu sync.Mutex
+	states   []workerState
+}
+
+// workerState is one worker's in-memory live status.
+type workerState struct {
+	busy     bool
+	taskID   uint64
+	taskType string
+	clientID string
+	since    time.Time
+}
+
+// WorkerStatus is the public snapshot of a worker for the /api/workers endpoint.
+type WorkerStatus struct {
+	ID       int    `json:"id"`
+	Busy     bool   `json:"busy"`
+	TaskID   uint64 `json:"task_id,omitempty"`
+	TaskType string `json:"task_type,omitempty"`
+	ClientID string `json:"client_id,omitempty"`
+	BusyMs   int64  `json:"busy_ms,omitempty"` // how long it's been on this task
 }
 
 // Publisher is the slice of the SSE hub the pool needs: announce that a task changed
@@ -53,10 +78,49 @@ func NewPool(tasks *services.TaskService, instanceID string, numWorkers int, pub
 		instanceID: instanceID,
 		numWorkers: numWorkers,
 		pub:        pub,
+		states:     make([]workerState, numWorkers),
 		// Buffered to numWorkers so the scheduler can stage a little work ahead
 		// without blocking on every single Submit.
 		queue: make(chan *models.Task, numWorkers),
 	}
+}
+
+// InstanceID reports which backend instance this pool belongs to (for the dashboard).
+func (p *Pool) InstanceID() string { return p.instanceID }
+
+// WorkerStates returns a snapshot of what every worker is doing right now.
+func (p *Pool) WorkerStates() []WorkerStatus {
+	p.statesMu.Lock()
+	defer p.statesMu.Unlock()
+
+	out := make([]WorkerStatus, len(p.states))
+	for i, st := range p.states {
+		ws := WorkerStatus{ID: i + 1, Busy: st.busy}
+		if st.busy {
+			ws.TaskID = st.taskID
+			ws.TaskType = st.taskType
+			ws.ClientID = st.clientID
+			ws.BusyMs = time.Since(st.since).Milliseconds()
+		}
+		out[i] = ws
+	}
+	return out
+}
+
+// setBusy / setIdle record a worker's current state (called as it picks up / finishes
+// a task) so WorkerStates can report it live.
+func (p *Pool) setBusy(workerID int, task *models.Task) {
+	p.statesMu.Lock()
+	p.states[workerID-1] = workerState{
+		busy: true, taskID: task.ID, taskType: task.Type, clientID: task.ClientID, since: time.Now(),
+	}
+	p.statesMu.Unlock()
+}
+
+func (p *Pool) setIdle(workerID int) {
+	p.statesMu.Lock()
+	p.states[workerID-1] = workerState{busy: false}
+	p.statesMu.Unlock()
 }
 
 // publish sends a task event if a publisher is wired (nil-safe).
@@ -121,6 +185,9 @@ func (p *Pool) worker(id int) {
 // process runs a single task end-to-end: pick its handler, run it, then record the
 // result (complete on success, fail/retry/dead-letter on error).
 func (p *Pool) process(workerID int, task *models.Task) {
+	p.setBusy(workerID, task)
+	defer p.setIdle(workerID) // mark idle again no matter how this returns
+
 	slog.Info("task started",
 		"worker", workerID, "task_id", task.ID, "client", task.ClientID,
 		"type", task.Type, "priority", task.Priority)

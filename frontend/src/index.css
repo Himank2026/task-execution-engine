@@ -1,0 +1,13 @@
+/* Minimal global reset. Mantine provides almost all styling, so this stays tiny. */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+/* The page background comes from Mantine's dark theme (set in main.tsx), so we don't
+   override it here — cards sit a shade lighter than the canvas for depth. */

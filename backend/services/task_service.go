@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -272,6 +273,35 @@ func (s *TaskService) FindStaleRunningTasks(timeout time.Duration) ([]models.Tas
 		return nil, err
 	}
 	return tasks, nil
+}
+
+// ResetDemoData is a DEV/DEMO helper: in one transaction it deletes the calling
+// client's tasks and dead-letter rows, then inserts n fresh random PENDING tasks. This
+// lets a demo start from a clean, predictable dataset without the table growing every
+// run. Scoped to clientID, so it never affects another tenant.
+func (s *TaskService) ResetDemoData(clientID string, n int) error {
+	demoTypes := []string{"send_email", "send_sms", "generate_report", "resize_image"}
+
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("client_id = ?", clientID).Delete(&models.Task{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("client_id = ?", clientID).Delete(&models.DeadLetterTask{}).Error; err != nil {
+			return err
+		}
+
+		tasks := make([]models.Task, 0, n)
+		for i := 0; i < n; i++ {
+			tasks = append(tasks, models.Task{
+				ClientID:   clientID,
+				Type:       demoTypes[rand.Intn(len(demoTypes))],
+				Priority:   uint8(rand.Intn(5) + 1),
+				Status:     "pending",
+				MaxRetries: 3,
+			})
+		}
+		return tx.Create(&tasks).Error
+	})
 }
 
 // CompleteTask marks a successfully-run task as completed. completed_at is set so

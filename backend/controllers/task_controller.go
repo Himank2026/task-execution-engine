@@ -118,3 +118,18 @@ func (tc *TaskController) Cancel(c *gin.Context) {
 
 	c.JSON(http.StatusOK, task)
 }
+
+// ResetDemo handles POST /api/demo/reset. DEV/DEMO ONLY: it wipes the calling client's
+// tasks and seeds a fresh batch of random ones, so demos start clean and the table
+// doesn't accumulate test rows. Scoped to the caller — never touches other tenants.
+func (tc *TaskController) ResetDemo(c *gin.Context) {
+	clientID := c.GetString("client_id")
+	const demoCount = 50
+
+	if err := tc.tasks.ResetDemoData(clientID, demoCount); err != nil {
+		respondError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"created": demoCount})
+}

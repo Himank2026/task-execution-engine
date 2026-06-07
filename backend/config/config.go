@@ -74,7 +74,7 @@ func Load() *Config {
 		WatchdogInterval: getEnvSeconds("WATCHDOG_INTERVAL_SECONDS", 15),
 		WatchdogTimeout:  getEnvSeconds("WATCHDOG_TIMEOUT_SECONDS", 60),
 
-		RateLimitMax:    getEnvInt("RATE_LIMIT_MAX", 10),
+		RateLimitMax:    getEnvInt("RATE_LIMIT_MAX", 120),
 		RateLimitWindow: getEnvSeconds("RATE_LIMIT_WINDOW_SECONDS", 60),
 	}
 }

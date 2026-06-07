@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -26,6 +28,11 @@ func RateLimit(limiter *ratelimit.Limiter) gin.HandlerFunc {
 
 		allowed, remaining, err := limiter.Allow(c.Request.Context(), clientID)
 		if err != nil {
+			// The client simply went away mid-request (e.g. closed an SSE stream) — the
+			// context is cancelled and there's nothing left to serve. Not an error.
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			// Redis is down or erroring. We FAIL OPEN: a limiter outage shouldn't take
 			// the whole API down with it. (Phase 6 follow-up: an in-memory fallback
 			// limiter instead of letting everything through.)

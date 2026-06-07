@@ -30,3 +30,17 @@ func (ac *AnalyticsController) Summary(c *gin.Context) {
 
 	c.JSON(http.StatusOK, summary)
 }
+
+// Throughput handles GET /api/analytics/throughput — a time-series of completions over
+// the last few minutes, for the throughput chart.
+func (ac *AnalyticsController) Throughput(c *gin.Context) {
+	clientID := c.GetString("client_id")
+
+	points, err := ac.analytics.GetThroughput(clientID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, points)
+}
